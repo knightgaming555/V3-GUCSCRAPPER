@@ -1,4 +1,4 @@
-name: Prewarm User Cache
+name: Prewarm User Cache (Insecure Password Input)
 
 on:
   workflow_dispatch:
@@ -7,7 +7,11 @@ on:
         description: "GUC Username (e.g., firstname.lastname)"
         required: true
         type: string
-      # DO NOT ADD PASSWORD AS INPUT
+
+      password:
+        description: "GUC Password (WARNING: Potentially exposed in logs)"
+        required: true
+        type: string
 
 jobs:
   prewarm:
@@ -19,9 +23,8 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.11" # Or your preferred Python version
+          python-version: "3.11"
 
-      # Install prerequisites for pycurl (might be needed by dependencies)
       - name: Install prerequisites (Ubuntu)
         run: |
           sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev
@@ -35,47 +38,21 @@ jobs:
         env:
           # Get username from the workflow input
           TARGET_USERNAME: ${{ github.event.inputs.username }}
-          # Inject secrets needed by the script directly
+          # !!! Get password DIRECTLY from input - INSECURE !!!
+          USER_PASSWORD: ${{ github.event.inputs.password }}
+          # Inject secrets needed by the script
           REDIS_URL: ${{ secrets.REDIS_URL }}
           ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
-          # NOTE: USER_PASSWORD is set *within* the run step below
         run: |
           echo "Attempting to prewarm cache for user: $TARGET_USERNAME"
+          echo "::warning::Password provided directly as workflow input. This is insecure and may be logged."
 
-          # --- Transform username to secret name format using shell commands ---
-          # 1. Uppercase
-          SECRET_USER_PART=$(echo "$TARGET_USERNAME" | tr '[:lower:]' '[:upper:]')
-          # 2. Replace '.' with '_'
-          SECRET_USER_PART=$(echo "$SECRET_USER_PART" | sed 's/\./_/g')
-          # 3. Replace '-' with '_'
-          SECRET_USER_PART=$(echo "$SECRET_USER_PART" | sed 's/-/_/g')
-          # 4. Append _PASSWORD
-          USER_PASSWORD_SECRET_NAME="${SECRET_USER_PART}_PASSWORD"
-          echo "Constructed secret name: $USER_PASSWORD_SECRET_NAME"
-          # --------------------------------------------------------------------
-
-          # --- Fetch the secret value dynamically using eval ---
-          # This relies on the runner using bash.
-          # It constructs the full expression like ${{ secrets.MOHAMED_ELSAADI_PASSWORD }}
-          # and evaluates it, storing the result in SECRET_FETCH_VAR.
-          eval "SECRET_FETCH_VAR=\${{ secrets.$USER_PASSWORD_SECRET_NAME }}"
-
-          # --- Check if the secret was found and export it ---
-          if [ -z "$SECRET_FETCH_VAR" ]; then
-              echo "::error::Password secret '$USER_PASSWORD_SECRET_NAME' not found or empty for user '$TARGET_USERNAME'."
-              # List available secret names (values are masked) to help debug naming
-              echo "Available secrets (names only):"
-              # This lists all secrets, which might be sensitive depending on your naming
-              # Consider removing this line in production if secret names are sensitive
-              echo "${{ toJSON(secrets.*) }}" | jq 'keys' # Use jq to list only keys if available
-              exit 1
-          else
-              echo "Password secret '$USER_PASSWORD_SECRET_NAME' found."
-              # Export the *value* to the USER_PASSWORD env var for the python script
-              # Use GITHUB_ENV to make it available to subsequent commands in the step
-              echo "USER_PASSWORD=$SECRET_FETCH_VAR" >> $GITHUB_ENV
+          # Check if password input is empty (basic validation)
+          if [ -z "$USER_PASSWORD" ]; then
+            echo "::error::Password input was empty."
+            exit 1
           fi
 
-          # --- Run the Python script ---
-          # The script will read USER_PASSWORD from the environment variables
+          # Run the script, passing only the username as argument
+          # The script reads USER_PASSWORD from the environment
           python scripts/prewarm_user_cache.py "$TARGET_USERNAME"
