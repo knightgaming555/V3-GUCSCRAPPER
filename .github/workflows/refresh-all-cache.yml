@@ -1,0 +1,69 @@
+name: Refresh All Cache Sections
+
+on:
+  schedule:
+    # Runs every 15 minutes (Adjust cron as needed)
+    - cron: "*/ * * * *"
+  workflow_dispatch: # Allows manual triggering
+    inputs:
+      username:
+        description: "Specific username to refresh (optional, leave empty for all)"
+        required: false
+
+jobs:
+  refresh_all_sections:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11" # Or your preferred Python version
+
+      # Install prerequisites for pycurl
+      - name: Install prerequisites (Ubuntu)
+        run: |
+          sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Determine Target Username
+        id: args
+        run: |
+          # Set username for manual dispatch, default to empty string for scheduled runs
+          USERNAME=${{ github.event.inputs.username || '' }}
+          echo "username=${USERNAME}" >> $GITHUB_OUTPUT
+          echo "Target Username: '${USERNAME:-<all users>}'"
+
+      - name: Run refresh cache script - Section 1
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+          # Pass other ENV VARS if needed by config.py or scrapers
+          # VERIFY_SSL: ${{ secrets.VERIFY_SSL || 'True' }}
+        run: |
+          echo "Running Section 1 for target: ${{ steps.args.outputs.username || 'all users' }}"
+          python scripts/refresh_cache.py 1 ${{ steps.args.outputs.username }}
+
+      - name: Run refresh cache script - Section 2
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+        run: |
+          echo "Running Section 2 for target: ${{ steps.args.outputs.username || 'all users' }}"
+          python scripts/refresh_cache.py 2 ${{ steps.args.outputs.username }}
+
+      - name: Run refresh cache script - Section 3
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+        run: |
+          echo "Running Section 3 for target: ${{ steps.args.outputs.username || 'all users' }}"
+          python scripts/refresh_cache.py 3 ${{ steps.args.outputs.username }}
+
+      # Optional: Add a step here to check script exit codes if needed

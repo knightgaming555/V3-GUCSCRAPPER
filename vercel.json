@@ -1,0 +1,30 @@
+{
+    "version": 2,
+    "builds": [
+      {
+        "src": "app.py",
+        "use": "@vercel/python",
+        "config": {
+          "maxLambdaSize": "50mb"
+        }
+      }
+    ],
+    "routes": [
+      {
+        "src": "/api/(.*)",
+        "dest": "app.py"
+      },
+      {
+        "src": "/(.*)",
+        "dest": "app.py"
+      }
+    ],
+    "env": {
+      "FLASK_APP": "app.py",
+      "PYTHONPATH": "$PYTHONPATH:.",
+      "REQUESTS_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt"
+    },
+    "github": {
+      "silent": true
+    }
+  }

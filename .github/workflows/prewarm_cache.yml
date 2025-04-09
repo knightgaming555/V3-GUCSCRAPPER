@@ -1,0 +1,81 @@
+name: Prewarm User Cache
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: "GUC Username (e.g., firstname.lastname)"
+        required: true
+        type: string
+      # DO NOT ADD PASSWORD AS INPUT
+
+jobs:
+  prewarm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11" # Or your preferred Python version
+
+      # Install prerequisites for pycurl (might be needed by dependencies)
+      - name: Install prerequisites (Ubuntu)
+        run: |
+          sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run prewarm script for user
+        env:
+          # Get username from the workflow input
+          TARGET_USERNAME: ${{ github.event.inputs.username }}
+          # Inject secrets needed by the script directly
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+          # NOTE: USER_PASSWORD is set *within* the run step below
+        run: |
+          echo "Attempting to prewarm cache for user: $TARGET_USERNAME"
+
+          # --- Transform username to secret name format using shell commands ---
+          # 1. Uppercase
+          SECRET_USER_PART=$(echo "$TARGET_USERNAME" | tr '[:lower:]' '[:upper:]')
+          # 2. Replace '.' with '_'
+          SECRET_USER_PART=$(echo "$SECRET_USER_PART" | sed 's/\./_/g')
+          # 3. Replace '-' with '_'
+          SECRET_USER_PART=$(echo "$SECRET_USER_PART" | sed 's/-/_/g')
+          # 4. Append _PASSWORD
+          USER_PASSWORD_SECRET_NAME="${SECRET_USER_PART}_PASSWORD"
+          echo "Constructed secret name: $USER_PASSWORD_SECRET_NAME"
+          # --------------------------------------------------------------------
+
+          # --- Fetch the secret value dynamically using eval ---
+          # This relies on the runner using bash.
+          # It constructs the full expression like ${{ secrets.MOHAMED_ELSAADI_PASSWORD }}
+          # and evaluates it, storing the result in SECRET_FETCH_VAR.
+          eval "SECRET_FETCH_VAR=\${{ secrets.$USER_PASSWORD_SECRET_NAME }}"
+
+          # --- Check if the secret was found and export it ---
+          if [ -z "$SECRET_FETCH_VAR" ]; then
+              echo "::error::Password secret '$USER_PASSWORD_SECRET_NAME' not found or empty for user '$TARGET_USERNAME'."
+              # List available secret names (values are masked) to help debug naming
+              echo "Available secrets (names only):"
+              # This lists all secrets, which might be sensitive depending on your naming
+              # Consider removing this line in production if secret names are sensitive
+              echo "${{ toJSON(secrets.*) }}" | jq 'keys' # Use jq to list only keys if available
+              exit 1
+          else
+              echo "Password secret '$USER_PASSWORD_SECRET_NAME' found."
+              # Export the *value* to the USER_PASSWORD env var for the python script
+              # Use GITHUB_ENV to make it available to subsequent commands in the step
+              echo "USER_PASSWORD=$SECRET_FETCH_VAR" >> $GITHUB_ENV
+          fi
+
+          # --- Run the Python script ---
+          # The script will read USER_PASSWORD from the environment variables
+          python scripts/prewarm_user_cache.py "$TARGET_USERNAME"
