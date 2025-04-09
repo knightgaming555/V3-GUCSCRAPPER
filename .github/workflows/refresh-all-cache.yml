@@ -66,4 +66,12 @@ jobs:
           echo "Running Section 3 for target: ${{ steps.args.outputs.username || 'all users' }}"
           python scripts/refresh_cache.py 3 ${{ steps.args.outputs.username }}
 
+      - name: Run refresh cache script - Section 4
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+        run: |
+          echo "Running Section 4 for target: ${{ steps.args.outputs.username || 'all users' }}"
+          python scripts/refresh_cache.py 4 ${{ steps.args.outputs.username }}
+
       # Optional: Add a step here to check script exit codes if needed
