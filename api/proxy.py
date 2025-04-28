@@ -4,15 +4,15 @@ from io import BytesIO
 from flask import Blueprint, request, jsonify, g, Response, stream_with_context
 import redis
 from werkzeug.http import parse_range_header
-import time  # Added for timing
-import base64  # Needed for PyPDF2 checks maybe
+import time
+import base64
 import concurrent.futures
 import threading
 import requests
-from requests_ntlm import HttpNtlmAuth  # Keep NTLM auth
+from requests_ntlm import HttpNtlmAuth
 import os
-import PyPDF2  # Keep for extraction
-import json  # Keep for JSON logging/responses
+import PyPDF2
+import json
 
 # Keep these imports if needed by extraction functions
 try:
@@ -30,54 +30,84 @@ except ImportError:
 
 from config import config
 from utils.auth import validate_credentials_flow, AuthError
-
-# ---> Use the simple binary cache functions and correct cache key generator <---
 from utils.cache import (
     generate_cache_key,
     save_binary_simple,
     get_binary_simple,
     get_from_cache,
     set_in_cache,
-)  # Also need standard cache for /extract
+    redis_client,  # Import redis_client from cache utils
+)
 from utils.helpers import guess_content_type
-
-# Import file fetching and extraction from scraping module
 from scraping.files import fetch_file_content, extract_text_from_file
-
-# Import session creation for HEAD request and original proxy download session
 from scraping.core import create_session, make_request
 
 logger = logging.getLogger(__name__)
 proxy_bp = Blueprint("proxy_bp", __name__)
 
-CACHE_PREFIX_PROXY = "proxy_file"  # Cache prefix for proxied file content
-CACHE_PREFIX_EXTRACT = "extract_text"  # Cache prefix for extracted text
-
-# --- Logging setup from original file (keep if not handled globally) ---
-# This might be redundant if app.py sets up logging, but safe to keep if running standalone
-# logging.basicConfig(
-#     level=logging.INFO,
-#     format="%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s",
-# )
-
-# --- Background logging task and executor (keep from original) ---
-API_LOG_KEY = "api_logs"  # Specific Redis key for proxy/extractor logs
+CACHE_PREFIX_PROXY = "proxy_file"
+CACHE_PREFIX_EXTRACT = "extract_text"
+API_LOG_KEY = "api_logs"
 MAX_LOG_ENTRIES = 5000
 log_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=5, thread_name_prefix="LogThread"
 )
-# Use the redis client from utils.cache
-from utils.cache import redis_client
+
+# ---> Define Mock User Credentials and Real Credentials to Use <---
+MOCK_USERNAME = "google.user"
+MOCK_PASSWORD = (
+    "google@3569"  # Only used for initial check if needed by validate_credentials_flow
+)
+REAL_USERNAME_FOR_MOCK = "mohamed.elsaadi"
+REAL_PASSWORD_FOR_MOCK = (
+    "Messo-1245"  # IMPORTANT: Store this securely, e.g., env variables
+)
 
 
+# --- Helper Function to Get Credentials for Upstream Request ---
+def get_upstream_credentials(request_username, request_password):
+    """
+    Determines the credentials to use for the upstream request.
+    If the request uses the mock credentials, it bypasses validation
+    for those and returns the predefined real credentials.
+    Otherwise, it validates the incoming credentials using validate_credentials_flow.
+
+    Returns:
+        tuple[str, str]: (username_for_upstream, password_for_upstream)
+    Raises:
+        AuthError: If validation fails for a non-mock user.
+    """
+    # Step 1: Check if the incoming user is the mock user FIRST
+    if request_username == MOCK_USERNAME:
+        # Optional: You could add a basic check for the mock password here if desired,
+        # but it's often sufficient just to check the username for mock scenarios.
+        # if request_password == MOCK_PASSWORD:
+        logger.info(
+            f"Mock user '{MOCK_USERNAME}' detected. Bypassing validation and using real credentials for upstream request."
+        )
+        # Return the predefined real credentials directly
+        return REAL_USERNAME_FOR_MOCK, REAL_PASSWORD_FOR_MOCK
+        # else:
+        #     # If you want to enforce the mock password match
+        #     raise AuthError("Invalid mock password provided", 401, "mock_auth_fail")
+
+    else:
+        # Step 2: For any other user, validate their credentials as normal
+        logger.info(f"Non-mock user '{request_username}'. Validating credentials.")
+        # This will raise AuthError if validation fails for the real user
+        password_to_use_validated = validate_credentials_flow(
+            request_username, request_password
+        )
+        return request_username, password_to_use_validated
+
+
+# --- Logging Task (remains the same) ---
 def _log_to_redis_task(log_entry_dict):
-    """Internal task to write logs to Redis asynchronously."""
+    # ... (logging implementation remains the same) ...
     if not redis_client:
-        # Use logger if Redis fails
         logger.warning(f"Redis unavailable for logging. Stdout log: {log_entry_dict}")
         return
     try:
-        # Use string client for logging
         str_redis_client = redis.from_url(config.REDIS_URL, decode_responses=True)
         log_entry_json = json.dumps(log_entry_dict, default=str)
         pipe = str_redis_client.pipeline()
@@ -100,26 +130,9 @@ def _log_to_redis_task(log_entry_dict):
         )
 
 
-# --- Session from original file (keep if scraping.core doesn't provide suitable one) ---
-# Or better: Ensure scraping.core.create_session is sufficient
-session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(
-    pool_connections=10, pool_maxsize=20, max_retries=3, pool_block=False
-)
-session.mount("http://", adapter)
-session.mount("https://", adapter)
-
-# --- Request Hooks (keep from original file - should be integrated in app.py) ---
-# These might be redundant if app.py handles before/after request globally
-# Commenting out for now, assuming app.py handles it
-# @app.before_request ...
-# @app.after_request def after_request_logger(response): ...
-# @app.after_request def add_cors_headers(response): ...
-
-
-# --- Helper for Streaming ---
+# --- Helper for Streaming (remains the same) ---
 def generate_chunks(content: bytes, chunk_size: int = config.PROXY_CHUNK_SIZE):
-    """Yields chunks of byte content."""
+    # ... (chunk generation remains the same) ...
     logger.debug(
         f"Generating chunks of size {chunk_size} from content length {len(content)}"
     )
@@ -148,24 +161,29 @@ def file_info():
     """
     Endpoint to get file metadata (size, type, etc.) using a HEAD request.
     Requires query params: username, password, fileUrl
+    Uses real credentials if mock user is provided.
     """
-    username = request.args.get("username")
-    password = request.args.get("password")
+    request_username = request.args.get("username")
+    request_password = request.args.get("password")
     file_url = request.args.get("fileUrl")
-    g.username = username  # Set for logging
+    g.username = request_username  # Log the original request username
 
-    # Validation moved inside try block for cleaner AuthError handling
     try:
         if not file_url:
             raise AuthError("Missing fileUrl parameter", 400, "validation_error")
 
-        # Use validate_credentials_flow for consistency, create session separately
-        password_to_use = validate_credentials_flow(username, password)
-        # Use create_session from scraping.core for consistency
-        head_session = create_session(username, password_to_use)
+        # ---> Get credentials to use for the actual HEAD request <---
+        username_for_upstream, password_for_upstream = get_upstream_credentials(
+            request_username, request_password
+        )
+        # ----------------------------------------------------------
 
-        logger.info(f"Fetching HEAD for file info: {file_url}")
-        # Use make_request from scraping.core
+        # Use create_session with the potentially overridden credentials
+        head_session = create_session(username_for_upstream, password_for_upstream)
+
+        logger.info(
+            f"Fetching HEAD for file info: {file_url} (using upstream user: {username_for_upstream})"
+        )
         response = make_request(head_session, file_url, method="HEAD", timeout=(10, 15))
 
         if not response:
@@ -178,6 +196,7 @@ def file_info():
                 502,
             )
 
+        # ... (rest of the file info processing remains the same) ...
         content_type = response.headers.get("Content-Type", "application/octet-stream")
         content_length_str = response.headers.get("Content-Length")
         last_modified = response.headers.get("Last-Modified")
@@ -199,8 +218,9 @@ def file_info():
         )
 
     except AuthError as e:
+        # This will catch validation errors from get_upstream_credentials too
         logger.warning(
-            f"AuthError during file info request for {username}: {e.log_message}"
+            f"AuthError during file info request for {request_username}: {e.log_message}"
         )
         g.log_outcome = e.log_outcome
         g.log_error_message = e.log_message
@@ -215,14 +235,13 @@ def file_info():
 @proxy_bp.route("/proxy", methods=["GET"])
 def proxy_file():
     """
-    Proxies a file download from an NTLM-protected source.
+    Proxies a file download. Uses real credentials if mock user is provided.
     Uses simple Base64 caching. Supports basic Range requests from cache.
     Requires query params: username, password, fileUrl
     """
-    req_start_time = time.perf_counter()  # Start timing req processing
+    req_start_time = time.perf_counter()
 
-    if request.args.get("bot", "").lower() == "true":  # Bot check
-        # ... (same as before) ...
+    if request.args.get("bot", "").lower() == "true":
         logger.info("Received bot health check request for Proxy API.")
         g.log_outcome = "bot_check_success"
         return (
@@ -232,29 +251,41 @@ def proxy_file():
             200,
         )
 
-    username = request.args.get("username")
-    password = request.args.get("password")
+    request_username = request.args.get("username")
+    request_password = request.args.get("password")
     file_url = request.args.get("fileUrl")
-    g.username = username
+    g.username = request_username  # Log original request username
 
     try:
         if not file_url:
             raise AuthError("Missing fileUrl parameter", 400, "validation_error")
 
         auth_start = time.perf_counter()
-        password_to_use = validate_credentials_flow(username, password)
+        # ---> Get credentials for potential upstream fetch <---
+        username_for_upstream, password_for_upstream = get_upstream_credentials(
+            request_username, request_password
+        )
         auth_duration = (time.perf_counter() - auth_start) * 1000
-        logger.info(f"TIMING: Proxy Auth flow took {auth_duration:.2f} ms")
+        logger.info(
+            f"TIMING: Proxy Auth flow (incl. potential override) took {auth_duration:.2f} ms"
+        )
+        # -----------------------------------------------------
 
-        cache_key = generate_cache_key(CACHE_PREFIX_PROXY, username, file_url)
+        # ---> Cache key uses the *original* requesting user, not the upstream one <---
+        # This ensures the mock user gets their own cache entry if needed,
+        # separate from the real user's cache.
+        cache_key = generate_cache_key(CACHE_PREFIX_PROXY, request_username, file_url)
+        # ----------------------------------------------------------------------------
+
         file_name = file_url.split("/")[-1].split("?")[0] or "downloaded_file"
         content_type = guess_content_type(file_name)
 
-        # --- Range Request Handling ---
+        # --- Range Request Handling (remains the same) ---
         range_header = request.headers.get("Range")
         start, end = None, None
         is_range_request = False
         if range_header:
+            # ... (range parsing logic is unchanged) ...
             try:
                 range_obj = parse_range_header(range_header)
                 if (
@@ -265,29 +296,29 @@ def proxy_file():
                     start, end = range_obj.ranges[0]
                     is_range_request = True
                     logger.info(
-                        f"Range requested: bytes={start}-{end if end is not None else ''}"
+                        f"Range requested: bytes={start}-{end if end is not None else ''} for user {request_username}"
                     )
                 else:
                     logger.warning(f"Unsupported range header format: {range_header}")
             except ValueError:
                 logger.warning(f"Invalid range header: {range_header}")
 
-        # --- Cache Check ---
+        # --- Cache Check (using original user's cache key) ---
         cache_check_start = time.perf_counter()
         cached_content = get_binary_simple(cache_key)
         cache_check_duration = (time.perf_counter() - cache_check_start) * 1000
         logger.info(
-            f"TIMING: Proxy Redis cache check took {cache_check_duration:.2f} ms"
+            f"TIMING: Proxy Redis cache check for key {cache_key} took {cache_check_duration:.2f} ms"
         )
 
         if cached_content:
-            logger.info(f"Proxy cache hit for: {file_url}")
+            # ... (cache hit logic, including range handling, remains the same) ...
+            logger.info(f"Proxy cache hit for key: {cache_key}")
             g.log_outcome = "cache_hit"
             total_size = len(cached_content)
 
-            if (
-                is_range_request and start is not None
-            ):  # Process range request from cache
+            if is_range_request and start is not None:
+                # ... serve partial from cache ...
                 if end is None or end >= total_size:
                     end = total_size - 1
                 if (
@@ -295,15 +326,11 @@ def proxy_file():
                     or start < 0
                     or (end is not None and start > end)
                 ):
-                    logger.warning(
-                        f"Invalid range {start}-{end} for cached size {total_size}"
-                    )
                     return Response(
                         "Range Not Satisfiable",
                         status=416,
                         headers={"Content-Range": f"bytes */{total_size}"},
                     )
-
                 content_to_serve = cached_content[start : end + 1]
                 resp_length = len(content_to_serve)
                 headers = {
@@ -315,14 +342,15 @@ def proxy_file():
                     "X-Source": "redis-cache (partial)",
                 }
                 logger.info(
-                    f"Serving partial content from cache ({resp_length} bytes) for {file_url}"
+                    f"Serving partial content from cache ({resp_length} bytes) for key {cache_key}"
                 )
                 resp = Response(
                     stream_with_context(generate_chunks(content_to_serve)),
                     headers=headers,
                     status=206,
                 )
-            else:  # Serve full file from cache
+            else:
+                # ... serve full from cache ...
                 headers = {
                     "Content-Disposition": f'attachment; filename="{file_name}"',
                     "Content-Type": content_type,
@@ -332,7 +360,7 @@ def proxy_file():
                     "X-Source": "redis-cache (full)",
                 }
                 logger.info(
-                    f"Serving full file from cache ({total_size} bytes) for {file_url}"
+                    f"Serving full file from cache ({total_size} bytes) for key {cache_key}"
                 )
                 resp = Response(
                     stream_with_context(generate_chunks(cached_content)),
@@ -342,20 +370,27 @@ def proxy_file():
 
             req_end_time = time.perf_counter()
             logger.info(
-                f"TIMING: Proxy Cache Hit request processed in {(req_end_time - req_start_time) * 1000:.2f} ms"
+                f"TIMING: Proxy Cache Hit request (user {request_username}) processed in {(req_end_time - req_start_time) * 1000:.2f} ms"
             )
             return resp
 
         # --- Cache Miss -> Fetch and Stream ---
-        logger.info(f"Proxy cache miss. Fetching and streaming: {file_url}")
+        logger.info(f"Proxy cache miss for key {cache_key}. Fetching: {file_url}")
         g.log_outcome = "fetch_stream_attempt"
 
         fetch_start = time.perf_counter()
-        file_content = fetch_file_content(username, password_to_use, file_url)
+        # ---> Use the potentially overridden credentials for fetching <---
+        file_content = fetch_file_content(
+            username_for_upstream, password_for_upstream, file_url
+        )
+        # -------------------------------------------------------------
         fetch_duration = (time.perf_counter() - fetch_start) * 1000
-        logger.info(f"TIMING: Proxy file fetch took {fetch_duration:.2f} ms")
+        logger.info(
+            f"TIMING: Proxy file fetch (upstream user {username_for_upstream}) took {fetch_duration:.2f} ms"
+        )
 
         if file_content is None:
+            # ... (fetch error handling remains the same) ...
             g.log_outcome = "fetch_error"
             g.log_error_message = f"Failed to fetch file content for proxy: {file_url}"
             return (
@@ -363,30 +398,29 @@ def proxy_file():
                 502,
             )
         else:
+            # ... (fetch success handling remains the same) ...
             g.log_outcome = "fetch_stream_success"
             total_size = len(file_content)
             logger.info(
-                f"Successfully fetched {total_size} bytes for {file_url}. Streaming to client."
+                f"Successfully fetched {total_size} bytes for {file_url} (upstream user {username_for_upstream}). Streaming to client {request_username}."
             )
 
-            # Save synchronously before starting stream
+            # ---> Save to cache using the *original* user's cache key <---
             cache_save_start = time.perf_counter()
-            cache_success = save_binary_simple(
-                cache_key, file_content
-            )  # Use simple save
+            cache_success = save_binary_simple(cache_key, file_content)
             cache_save_duration = (time.perf_counter() - cache_save_start) * 1000
             logger.info(
-                f"TIMING: Proxy cache save (simple SETEX) took {cache_save_duration:.2f} ms"
+                f"TIMING: Proxy cache save to key {cache_key} took {cache_save_duration:.2f} ms"
             )
             if not cache_success:
                 logger.warning(f"Failed to cache file content (simple) for {cache_key}")
+            # -----------------------------------------------------------
 
-            # --- Range handling for LIVE fetch (Optional but good practice) ---
-            # If a range was requested but we had a cache miss, we fetched the WHOLE file.
-            # We *could* now serve just the requested range from the fetched content.
+            # --- Range handling for LIVE fetch (remains the same logic, uses fetched content) ---
             if is_range_request and start is not None:
+                # ... serve partial from live fetch ...
                 logger.info(
-                    f"Serving range request from live fetch result for {file_url}"
+                    f"Serving range request from live fetch result for key {cache_key}"
                 )
                 if end is None or end >= total_size:
                     end = total_size - 1
@@ -395,15 +429,11 @@ def proxy_file():
                     or start < 0
                     or (end is not None and start > end)
                 ):
-                    logger.warning(
-                        f"Invalid range {start}-{end} for live fetched size {total_size}"
-                    )
                     return Response(
                         "Range Not Satisfiable",
                         status=416,
                         headers={"Content-Range": f"bytes */{total_size}"},
                     )
-
                 content_to_serve = file_content[start : end + 1]
                 resp_length = len(content_to_serve)
                 headers = {
@@ -419,7 +449,8 @@ def proxy_file():
                     headers=headers,
                     status=206,
                 )
-            else:  # Serve full live fetch response
+            else:
+                # ... serve full live fetch ...
                 headers = {
                     "Content-Disposition": f'attachment; filename="{file_name}"',
                     "Content-Type": content_type,
@@ -436,13 +467,13 @@ def proxy_file():
 
             req_end_time = time.perf_counter()
             logger.info(
-                f"TIMING: Proxy Cache Miss request processed in {(req_end_time - req_start_time) * 1000:.2f} ms"
+                f"TIMING: Proxy Cache Miss request (user {request_username}) processed in {(req_end_time - req_start_time) * 1000:.2f} ms"
             )
             return resp
 
     except AuthError as e:
         logger.warning(
-            f"AuthError during proxy request for {username}: {e.log_message}"
+            f"AuthError during proxy request for {request_username}: {e.log_message}"
         )
         g.log_outcome = e.log_outcome
         g.log_error_message = e.log_message
@@ -460,10 +491,9 @@ def proxy_file():
             500,
         )
 
-    # Log timing even on error paths
     req_end_time_err = time.perf_counter()
     logger.info(
-        f"TIMING: Proxy Error request processed in {(req_end_time_err - req_start_time) * 1000:.2f} ms"
+        f"TIMING: Proxy Error request (user {request_username}) processed in {(req_end_time_err - req_start_time) * 1000:.2f} ms"
     )
     return resp
 
@@ -471,14 +501,13 @@ def proxy_file():
 @proxy_bp.route("/extract", methods=["GET"])
 def extract_text():
     """
-    Fetches a file (PDF, DOCX, PPTX, TXT) and extracts its text content.
-    Supports caching of extracted text.
+    Fetches a file and extracts text. Uses real credentials if mock user is provided.
+    Supports caching of extracted text and underlying binary file.
     Requires query params: username, password, fileUrl
     """
     req_start_time = time.perf_counter()
 
-    if request.args.get("bot", "").lower() == "true":  # Bot check
-        # ... (same as before) ...
+    if request.args.get("bot", "").lower() == "true":
         logger.info("Received bot health check request for Extract API.")
         g.log_outcome = "bot_check_success"
         return (
@@ -492,79 +521,97 @@ def extract_text():
             200,
         )
 
-    username = request.args.get("username")
-    password = request.args.get("password")
+    request_username = request.args.get("username")
+    request_password = request.args.get("password")
     file_url = request.args.get("fileUrl")
     force_refresh = request.args.get("force_refresh", "false").lower() == "true"
-    g.username = username
+    g.username = request_username  # Log original request username
 
     try:
         if not file_url:
             raise AuthError("Missing fileUrl parameter", 400, "validation_error")
 
         auth_start = time.perf_counter()
-        password_to_use = validate_credentials_flow(username, password)
+        # ---> Get credentials for potential upstream fetch <---
+        username_for_upstream, password_for_upstream = get_upstream_credentials(
+            request_username, request_password
+        )
         auth_duration = (time.perf_counter() - auth_start) * 1000
-        logger.info(f"TIMING: Extract Auth flow took {auth_duration:.2f} ms")
+        logger.info(
+            f"TIMING: Extract Auth flow (incl. potential override) took {auth_duration:.2f} ms"
+        )
+        # -----------------------------------------------------
 
         file_name = file_url.split("/")[-1].split("?")[0] or "unknown_file"
 
-        # --- Cache Check (for extracted text) ---
-        extract_cache_key = generate_cache_key(CACHE_PREFIX_EXTRACT, username, file_url)
+        # --- Cache Check (for *extracted text*, uses original user's key) ---
+        extract_cache_key = generate_cache_key(
+            CACHE_PREFIX_EXTRACT, request_username, file_url
+        )
         if not force_refresh:
             cache_check_start = time.perf_counter()
-            cached_text_data = get_from_cache(
-                extract_cache_key
-            )  # Standard JSON cache check
+            cached_text_data = get_from_cache(extract_cache_key)
             cache_check_duration = (time.perf_counter() - cache_check_start) * 1000
             logger.info(
-                f"TIMING: Extract text cache check took {cache_check_duration:.2f} ms"
+                f"TIMING: Extract text cache check for key {extract_cache_key} took {cache_check_duration:.2f} ms"
             )
             if (
                 cached_text_data is not None
                 and isinstance(cached_text_data, dict)
                 and "text" in cached_text_data
             ):
-                logger.info(f"Serving extracted text from cache for: {file_url}")
+                logger.info(
+                    f"Serving extracted text from cache for key: {extract_cache_key}"
+                )
                 g.log_outcome = "cache_hit"
                 req_end_time = time.perf_counter()
                 logger.info(
-                    f"TIMING: Extract Cache Hit request processed in {(req_end_time - req_start_time) * 1000:.2f} ms"
+                    f"TIMING: Extract Cache Hit request (user {request_username}) processed in {(req_end_time - req_start_time) * 1000:.2f} ms"
                 )
                 return jsonify(cached_text_data), 200
 
-        # --- Cache Miss -> Fetch File Content (uses binary cache) ---
+        # --- Cache Miss for Text -> Get File Content ---
         logger.info(
-            f"Cache miss for extracted text. Getting file content for: {file_url}"
+            f"Cache miss for extracted text ({extract_cache_key}). Getting file content for: {file_url}"
         )
         g.log_outcome = "fetch_attempt"
 
-        # Check simple binary cache first
+        # ---> Check simple binary cache (using *original* user's key) <---
         bin_cache_check_start = time.perf_counter()
-        binary_cache_key = generate_cache_key(CACHE_PREFIX_PROXY, username, file_url)
-        file_content = get_binary_simple(binary_cache_key)  # Use simple getter
+        binary_cache_key = generate_cache_key(
+            CACHE_PREFIX_PROXY, request_username, file_url
+        )
+        file_content = get_binary_simple(binary_cache_key)
         bin_cache_check_duration = (time.perf_counter() - bin_cache_check_start) * 1000
         logger.info(
-            f"TIMING: Extract binary cache check took {bin_cache_check_duration:.2f} ms"
+            f"TIMING: Extract binary cache check for key {binary_cache_key} took {bin_cache_check_duration:.2f} ms"
         )
         source = "redis-cache"
+        # --------------------------------------------------------------------
 
         if not file_content:
             logger.info(f"Binary cache miss for {binary_cache_key}. Fetching live.")
             source = "live-fetch"
             fetch_start = time.perf_counter()
-            file_content = fetch_file_content(username, password_to_use, file_url)
+            # ---> Use potentially overridden credentials for live fetch <---
+            file_content = fetch_file_content(
+                username_for_upstream, password_for_upstream, file_url
+            )
+            # ------------------------------------------------------------
             fetch_duration = (time.perf_counter() - fetch_start) * 1000
-            logger.info(f"TIMING: Extract file fetch took {fetch_duration:.2f} ms")
+            logger.info(
+                f"TIMING: Extract file fetch (upstream user {username_for_upstream}) took {fetch_duration:.2f} ms"
+            )
 
             if file_content:
-                # Save fetched content to simple binary cache
+                # ---> Save fetched content to binary cache (using *original* user's key) <---
                 save_start = time.perf_counter()
-                save_binary_simple(binary_cache_key, file_content)  # Use simple saver
+                save_binary_simple(binary_cache_key, file_content)
                 save_duration = (time.perf_counter() - save_start) * 1000
                 logger.info(
-                    f"TIMING: Extract binary cache save took {save_duration:.2f} ms"
+                    f"TIMING: Extract binary cache save to key {binary_cache_key} took {save_duration:.2f} ms"
                 )
+                # ---------------------------------------------------------------------------
 
         if file_content is None:
             g.log_outcome = "fetch_error"
@@ -576,10 +623,10 @@ def extract_text():
                 502,
             )
 
-        # --- Extract Text ---
+        # --- Extract Text (logic remains the same) ---
         extract_start = time.perf_counter()
         logger.info(
-            f"Starting text extraction ({len(file_content)} bytes, source: {source}) for: {file_name}"
+            f"Starting text extraction ({len(file_content)} bytes, source: {source}) for: {file_name} (request user: {request_username})"
         )
         g.log_outcome = "extract_attempt"
         extracted_text = extract_text_from_file(file_content, file_name)
@@ -587,6 +634,7 @@ def extract_text():
         logger.info(f"TIMING: Text extraction took {extract_duration:.2f} ms")
 
         if extracted_text.startswith("Error:") or "Unsupported" in extracted_text:
+            # ... (error handling for extraction remains the same) ...
             logger.warning(f"Text extraction failed for {file_name}: {extracted_text}")
             g.log_outcome = "extract_error"
             g.log_error_message = extracted_text
@@ -596,41 +644,41 @@ def extract_text():
                 status,
             )
         else:
+            # ... (success handling for extraction remains the same) ...
             g.log_outcome = "extract_success"
             logger.info(
                 f"Successfully extracted text ({len(extracted_text)} chars) for: {file_name}"
             )
             result_data = {"text": extracted_text}
 
-            # Cache the extracted text using standard JSON cache
+            # ---> Cache the extracted text (using *original* user's key) <---
             cache_set_start = time.perf_counter()
             set_in_cache(
                 extract_cache_key, result_data, timeout=config.CACHE_LONG_TIMEOUT
             )
             cache_set_duration = (time.perf_counter() - cache_set_start) * 1000
             logger.info(
-                f"TIMING: Extract text cache save took {cache_set_duration:.2f} ms"
+                f"TIMING: Extract text cache save to key {extract_cache_key} took {cache_set_duration:.2f} ms"
             )
             logger.info(f"Cached extracted text for {extract_cache_key}")
+            # ----------------------------------------------------------------
 
             resp = jsonify(result_data), 200
 
         req_end_time = time.perf_counter()
         logger.info(
-            f"TIMING: Extract request processed in {(req_end_time - req_start_time) * 1000:.2f} ms"
+            f"TIMING: Extract request (user {request_username}) processed in {(req_end_time - req_start_time) * 1000:.2f} ms"
         )
         return resp
 
     except AuthError as e:
-        # ... (same error handling) ...
         logger.warning(
-            f"AuthError during extract request for {username}: {e.log_message}"
+            f"AuthError during extract request for {request_username}: {e.log_message}"
         )
         g.log_outcome = e.log_outcome
         g.log_error_message = e.log_message
         resp = jsonify({"status": "error", "message": str(e)}), e.status_code
     except Exception as e:
-        # ... (same error handling) ...
         logger.exception(
             f"Unhandled exception during /api/extract for {g.username or 'unknown user'}: {e}"
         )
@@ -643,16 +691,23 @@ def extract_text():
             500,
         )
 
-    # Log timing even on error paths
     req_end_time_err = time.perf_counter()
     logger.info(
-        f"TIMING: Extract Error request processed in {(req_end_time_err - req_start_time) * 1000:.2f} ms"
+        f"TIMING: Extract Error request (user {request_username}) processed in {(req_end_time_err - req_start_time) * 1000:.2f} ms"
     )
     return resp
 
 
-# --- Main Execution (keep from original for standalone testing if needed) ---
+# --- Main Execution (if needed for standalone testing) ---
 # if __name__ == "__main__":
-#     def shutdown_log_executor(): ...
+#     import atexit
+#     def shutdown_log_executor():
+#         print("Shutting down log executor...")
+#         log_executor.shutdown(wait=True)
+#         print("Log executor shut down.")
 #     atexit.register(shutdown_log_executor)
-#     app.run(host="0.0.0.0", port=5000, debug=True) # Use app.debug from config?
+#     # Need a Flask app instance to run this
+#     # from flask import Flask
+#     # app = Flask(__name__)
+#     # app.register_blueprint(proxy_bp, url_prefix='/api')
+#     # app.run(host="0.0.0.0", port=5000, debug=True)

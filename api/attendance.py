@@ -13,6 +13,7 @@ from utils.cache import (
     delete_from_cache,
 )
 from scraping.attendance import scrape_attendance  # Import the updated scraper
+from utils.mock_data import attendance_mockData
 
 logger = logging.getLogger(__name__)
 attendance_bp = Blueprint("attendance_bp", __name__)
@@ -45,9 +46,15 @@ def api_attendance():
     username = request.args.get("username")
     password = request.args.get("password")
     # Read the force_fetch parameter, default to False if not present or invalid value
+
     force_fetch = request.args.get("force_fetch", "false", type=str).lower() == "true"
     g.username = username
 
+    if username == "google.user" and password == "google@3569":
+        logger.info(f"Serving mock attendance data for user {username}")
+        g.log_outcome = "mock_data_served"
+        # Use the imported mock data and jsonify it
+        return jsonify(attendance_mockData), 200
     try:
         password_to_use = validate_credentials_flow(username, password)
 

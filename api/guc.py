@@ -15,6 +15,7 @@ from scraping.guc_data import scrape_guc_data_fast, scrape_guc_data
 
 # Import cached getters from helpers
 from utils.helpers import get_version_number_cached, get_dev_announcement_cached
+from utils.mock_data import guc_mockData
 
 logger = logging.getLogger(__name__)
 guc_bp = Blueprint("guc_bp", __name__)
@@ -70,6 +71,12 @@ def api_guc_data():
     first_time = request.args.get("first_time", "false").lower() == "true"
     g.username = username  # Set for logging
 
+    if username == "google.user" and password == "google@3569":
+        logger.info(f"Serving mock guc_data data for user {username}")
+        g.log_outcome = "mock_data_served"
+        # Use the imported mock data and jsonify it
+        return jsonify(guc_mockData), 200
+
     if not username or not password or not req_version:
         g.log_outcome = "validation_error"
         g.log_error_message = (
@@ -124,7 +131,7 @@ def api_guc_data():
                         "message": f"Incorrect version number. Please update the app to version {current_version}.",
                     }
                 ),
-                426,
+                403,
             )
 
         # --- Authentication (Remains the same) ---

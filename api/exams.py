@@ -6,6 +6,7 @@ from config import config
 from utils.auth import validate_credentials_flow, AuthError
 from utils.cache import get_from_cache, set_in_cache, generate_cache_key
 from scraping.exams import scrape_exam_seats  # Import the main exam seats scraper
+from utils.mock_data import exam_mockData
 
 logger = logging.getLogger(__name__)
 exams_bp = Blueprint("exams_bp", __name__)
@@ -40,6 +41,12 @@ def api_exam_seats():
     password = request.args.get("password")
     force_refresh = request.args.get("force_refresh", "false").lower() == "true"
     g.username = username
+
+    if username == "google.user" and password == "google@3569":
+        logger.info(f"Serving mock exam_seats data for user {username}")
+        g.log_outcome = "mock_data_served"
+        # Use the imported mock data and jsonify it
+        return jsonify(exam_mockData), 200
 
     try:
         password_to_use = validate_credentials_flow(username, password)
