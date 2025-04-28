@@ -24,7 +24,6 @@ try:
     from scraping import (
         scrape_cms_courses,  # Sync (fetches course list)
         scrape_grades,  # Sync
-        scrape_attendance,  # Sync
         scrape_exam_seats,  # Sync
     )
 except ImportError as e:
@@ -44,7 +43,6 @@ logger = logging.getLogger("prewarm_user_cache")
 DATA_TYPES_TO_PREWARM = {
     "cms_courses": scrape_cms_courses,
     "grades": scrape_grades,
-    "attendance": scrape_attendance,
     "exam_seats": scrape_exam_seats,
 }
 
