@@ -1,0 +1,124 @@
+name: Refresh All Cache Sections (TESTING - seif.elkady ONLY) # Modified name for clarity
+
+on:
+  schedule:
+    # Runs every 15 minutes (Adjust cron as needed)
+    # Use '*/15 * * * *' for every 15 minutes
+    - cron: "*/15 * * * *"
+  workflow_dispatch: # Allows manual triggering (but username input will be ignored for now)
+    inputs:
+      username:
+        description: "Specific username (NOTE: This input is currently IGNORED and forces 'seif.elkady')"
+        required: false
+
+jobs:
+  refresh_all_sections:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11" # Or your preferred Python version
+
+      # Install prerequisites for pycurl (if needed by requirements.txt)
+      - name: Install prerequisites (Ubuntu)
+        run: |
+          sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # --- MODIFIED STEP ---
+      - name: Determine Target Username (FORCED to seif.elkady for testing)
+        id: args
+        run: |
+          # --- OVERRIDE ---
+          # For testing purposes, always force the username to seif.elkady
+          # The manual input `github.event.inputs.username` is ignored.
+          USERNAME='seif.elkady'
+          echo "username=${USERNAME}" >> $GITHUB_OUTPUT
+          echo "Target Username (FORCED): '${USERNAME}'" # Updated log message
+
+      - name: Run refresh cache script - Section 1
+        env:
+          # Define ALL necessary secrets/env variables here
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+          # Example of other potential variables (uncomment/add as needed):
+          # GUC_USERNAME_SUFFIX: ${{ secrets.GUC_USERNAME_SUFFIX || '@student.guc.edu.eg' }}
+          # LOGIN_URL: ${{ secrets.LOGIN_URL }}
+          # MFA_SECRET_PLACEHOLDER: ${{ secrets.MFA_SECRET_PLACEHOLDER }} # If applicable
+          # LOG_LEVEL: ${{ secrets.LOG_LEVEL || 'INFO' }}
+          # VERIFY_SSL: ${{ secrets.VERIFY_SSL || 'True' }}
+          # CACHE_DEFAULT_TIMEOUT: ${{ secrets.CACHE_DEFAULT_TIMEOUT || 3600 }}
+          # CACHE_LONG_TIMEOUT: ${{ secrets.CACHE_LONG_TIMEOUT || 86400 }}
+          # CACHE_LONG_CMS_CONTENT_TIMEOUT: ${{ secrets.CACHE_LONG_CMS_CONTENT_TIMEOUT || 21600 }}
+          # PROXY_CACHE_EXPIRY: ${{ secrets.PROXY_CACHE_EXPIRY || 604800 }}
+        run: |
+          echo "Running Section 1 for FORCED target: ${{ steps.args.outputs.username }}"
+          python scripts/refresh_cache.py 1 ${{ steps.args.outputs.username }}
+
+      - name: Run refresh cache script - Section 2
+        env:
+          # Repeat ALL necessary secrets/env variables here
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+          # GUC_USERNAME_SUFFIX: ${{ secrets.GUC_USERNAME_SUFFIX || '@student.guc.edu.eg' }}
+          # LOGIN_URL: ${{ secrets.LOGIN_URL }}
+          # MFA_SECRET_PLACEHOLDER: ${{ secrets.MFA_SECRET_PLACEHOLDER }}
+          # LOG_LEVEL: ${{ secrets.LOG_LEVEL || 'INFO' }}
+          # VERIFY_SSL: ${{ secrets.VERIFY_SSL || 'True' }}
+          # CACHE_DEFAULT_TIMEOUT: ${{ secrets.CACHE_DEFAULT_TIMEOUT || 3600 }}
+          # CACHE_LONG_TIMEOUT: ${{ secrets.CACHE_LONG_TIMEOUT || 86400 }}
+          # CACHE_LONG_CMS_CONTENT_TIMEOUT: ${{ secrets.CACHE_LONG_CMS_CONTENT_TIMEOUT || 21600 }}
+          # PROXY_CACHE_EXPIRY: ${{ secrets.PROXY_CACHE_EXPIRY || 604800 }}
+        run: |
+          echo "Running Section 2 for FORCED target: ${{ steps.args.outputs.username }}"
+          python scripts/refresh_cache.py 2 ${{ steps.args.outputs.username }}
+
+      - name: Run refresh cache script - Section 3
+        env:
+          # Repeat ALL necessary secrets/env variables here
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+          # GUC_USERNAME_SUFFIX: ${{ secrets.GUC_USERNAME_SUFFIX || '@student.guc.edu.eg' }}
+          # LOGIN_URL: ${{ secrets.LOGIN_URL }}
+          # MFA_SECRET_PLACEHOLDER: ${{ secrets.MFA_SECRET_PLACEHOLDER }}
+          # LOG_LEVEL: ${{ secrets.LOG_LEVEL || 'INFO' }}
+          # VERIFY_SSL: ${{ secrets.VERIFY_SSL || 'True' }}
+          # CACHE_DEFAULT_TIMEOUT: ${{ secrets.CACHE_DEFAULT_TIMEOUT || 3600 }}
+          # CACHE_LONG_TIMEOUT: ${{ secrets.CACHE_LONG_TIMEOUT || 86400 }}
+          # CACHE_LONG_CMS_CONTENT_TIMEOUT: ${{ secrets.CACHE_LONG_CMS_CONTENT_TIMEOUT || 21600 }}
+          # PROXY_CACHE_EXPIRY: ${{ secrets.PROXY_CACHE_EXPIRY || 604800 }}
+        run: |
+          echo "Running Section 3 for FORCED target: ${{ steps.args.outputs.username }}"
+          python scripts/refresh_cache.py 3 ${{ steps.args.outputs.username }}
+
+      - name: Run refresh cache script - Section 4
+        env:
+          # Repeat ALL necessary secrets/env variables here
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+          # GUC_USERNAME_SUFFIX: ${{ secrets.GUC_USERNAME_SUFFIX || '@student.guc.edu.eg' }}
+          # LOGIN_URL: ${{ secrets.LOGIN_URL }}
+          # MFA_SECRET_PLACEHOLDER: ${{ secrets.MFA_SECRET_PLACEHOLDER }}
+          # LOG_LEVEL: ${{ secrets.LOG_LEVEL || 'INFO' }}
+          # VERIFY_SSL: ${{ secrets.VERIFY_SSL || 'True' }}
+          # CACHE_DEFAULT_TIMEOUT: ${{ secrets.CACHE_DEFAULT_TIMEOUT || 3600 }}
+          # CACHE_LONG_TIMEOUT: ${{ secrets.CACHE_LONG_TIMEOUT || 86400 }}
+          # CACHE_LONG_CMS_CONTENT_TIMEOUT: ${{ secrets.CACHE_LONG_CMS_CONTENT_TIMEOUT || 21600 }}
+          # PROXY_CACHE_EXPIRY: ${{ secrets.PROXY_CACHE_EXPIRY || 604800 }}
+        run: |
+          echo "Running Section 4 for FORCED target: ${{ steps.args.outputs.username }}"
+          python scripts/refresh_cache.py 4 ${{ steps.args.outputs.username }}
+
+      # Optional: Add a step here to check script exit codes if needed
+      # Example: Check if any script failed
+      # - name: Check script results
+      #   if: failure() # Runs only if any previous step failed
+      #   run: echo "One or more refresh script sections failed!" && exit 1
