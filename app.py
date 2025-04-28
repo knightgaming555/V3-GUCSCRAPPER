@@ -53,6 +53,7 @@ def create_app():
         from api.proxy import proxy_bp
         from api.admin import admin_bp
         from api.misc import misc_bp
+        from api.notifications import notifications_bp
 
         app.register_blueprint(auth_bp, url_prefix="/api")
         app.register_blueprint(guc_bp, url_prefix="/api")
@@ -66,6 +67,9 @@ def create_app():
             admin_bp, url_prefix="/api"
         )  # Admin endpoints under /api/admin
         app.register_blueprint(misc_bp, url_prefix="/api")  # Other endpoints
+        app.register_blueprint(
+            notifications_bp, url_prefix="/api"
+        )  # Notifications endpoint
 
         logger.info("Registered API Blueprints")
     except ImportError as e:
