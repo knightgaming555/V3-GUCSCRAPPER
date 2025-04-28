@@ -2,11 +2,9 @@
 import logging
 import json
 from flask import Blueprint, request, jsonify, g
-from datetime import datetime
 
 import redis
 
-from config import config
 from utils.auth import validate_credentials_flow, AuthError
 from utils.cache import get_from_cache, set_in_cache, generate_cache_key, redis_client
 
@@ -55,12 +53,18 @@ def api_notifications():
         cache_key = generate_cache_key(NOTIFICATIONS_CACHE_PREFIX, username)
         notifications = get_from_cache(cache_key) or []
 
-        # Limit to MAX_NOTIFICATIONS (This was already correct here)
+        # Limit to MAX_NOTIFICATIONS
         notifications_to_return = notifications[:MAX_NOTIFICATIONS]
 
         logger.info(
             f"Retrieved {len(notifications_to_return)} notifications for {username} (Cache holds {len(notifications)})"
         )
+
+        # Clear the notifications cache by setting it to an empty array
+        # Use a very long timeout to ensure it doesn't expire
+        set_in_cache(cache_key, [], timeout=31536000)  # 1 year in seconds
+        logger.info(f"Cleared notifications cache for {username}")
+
         g.log_outcome = "success"
 
         return jsonify(notifications_to_return), 200
@@ -143,10 +147,8 @@ def add_notification(username, notification_type, description):
                     notifications = notifications[:MAX_NOTIFICATIONS]
 
                 # Update cache within the transaction
-                # Use the default cache timeout from config or a specific one if needed
-                timeout = (
-                    config.CACHE_DEFAULT_TIMEOUT
-                )  # Or define a specific notification timeout
+                # Use a very long timeout to ensure it doesn't expire
+                timeout = 31536000  # 1 year in seconds
                 pipe.setex(cache_key, timeout, json.dumps(notifications))
 
                 # Execute the transaction
