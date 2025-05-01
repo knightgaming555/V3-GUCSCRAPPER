@@ -278,13 +278,6 @@ async def _refresh_single_cms_course(username, password, course_entry):
     # Original logic seemed to always add it? Check if this is desired.
     # Let's add it only if there's content or announcements, maybe?
     # Replicating original: add it regardless if fetch succeeded overall.
-    mock_week = {
-        "week_name": "Mock Week",
-        "announcement": "",
-        "description": "Placeholder",
-        "contents": [],
-    }
-    combined_data_for_cache.append(mock_week)
 
     # Add actual content weeks
     if content_list is not None and isinstance(content_list, list):
