@@ -116,12 +116,7 @@ def get_combined_course_data(
         return {"error": "Failed to fetch data for the specified course."}
 
     # 3. Assemble final list for caching and returning
-    mock_week = {
-        "week_name": "Mock Week",
-        "announcement": "",
-        "description": "Placeholder",
-        "contents": [],
-    }
+
     combined_data_for_cache = []
     course_announcement_dict_to_add = None
 
@@ -135,8 +130,6 @@ def get_combined_course_data(
                 f"Announcement scraping failed for {normalized_url}: {announcement_result['error']}"
             )
             # Optionally add error: combined_data_for_cache.append({"course_announcement_error": announcement_result['error']})
-
-    combined_data_for_cache.append(mock_week)
 
     if content_list is not None and isinstance(content_list, list):
         combined_data_for_cache.extend(content_list)
