@@ -22,9 +22,9 @@ class Config:
         raise ValueError("ENCRYPTION_KEY environment variable is not set.")
 
     # Cache
-    CACHE_DEFAULT_TIMEOUT = 1500  # Default cache timeout in seconds (25 mins)
+    CACHE_DEFAULT_TIMEOUT = 3600  # Default cache timeout in seconds (1 hour)
     CACHE_LONG_TIMEOUT = 5184000  # Longer cache for semi-static data (e.g., schedule)
-    CACHE_LONG_CMS_CONTENT_TIMEOUT = 10000
+    CACHE_LONG_CMS_CONTENT_TIMEOUT = 3600  # CMS content cache timeout (1 hour)
 
     # Admin / Secrets
     CACHE_REFRESH_SECRET = os.environ.get(
