@@ -122,14 +122,24 @@ def get_combined_course_data(
 
     if announcement_result and isinstance(announcement_result, dict):
         html_content = announcement_result.get("announcements_html")
-        if html_content and html_content.strip():
-            course_announcement_dict_to_add = {"course_announcement": html_content}
+        if html_content:
+            # Check if the content is just an empty div with whitespace
+            if html_content.strip() == '<div id="ContentPlaceHolderright_ContentPlaceHoldercontent_desc" style="overflow-x:auto;" class="p-xl-2">\n\n\n                                     </div>':
+                course_announcement_dict_to_add = {"course_announcement": ""}
+            else:
+                course_announcement_dict_to_add = {"course_announcement": html_content}
             combined_data_for_cache.append(course_announcement_dict_to_add)
-        elif "error" in announcement_result:
-            logger.warning(
-                f"Announcement scraping failed for {normalized_url}: {announcement_result['error']}"
-            )
-            # Optionally add error: combined_data_for_cache.append({"course_announcement_error": announcement_result['error']})
+        else:
+            # If no announcements or empty content, add empty string
+            course_announcement_dict_to_add = {"course_announcement": ""}
+            combined_data_for_cache.append(course_announcement_dict_to_add)
+    elif announcement_result and isinstance(announcement_result, dict) and "error" in announcement_result:
+        logger.warning(
+            f"Announcement scraping failed for {normalized_url}: {announcement_result['error']}"
+        )
+        # Add empty string for announcements on error
+        course_announcement_dict_to_add = {"course_announcement": ""}
+        combined_data_for_cache.append(course_announcement_dict_to_add)
 
     if content_list is not None and isinstance(content_list, list):
         combined_data_for_cache.extend(content_list)
