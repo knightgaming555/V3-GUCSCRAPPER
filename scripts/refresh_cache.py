@@ -169,6 +169,9 @@ REFRESH_CONFIG = {
     },
 }
 
+TARGET_NOTIFICATION_USERS = ["mohamed.elsaadi", "seif.elkady"] # Added for specific user notifications
+MAX_NOTIFICATIONS_LIMIT = 5 # Max notifications to keep per user
+
 SECTION_MAP = {
     "1": ["guc_data", "schedule"],
     "2": ["cms_courses", "grades"],
@@ -318,6 +321,7 @@ async def run_refresh_for_user(username, password, data_types_to_run):
     """Runs scraping tasks for a user based on requested data types."""
     user_results = {}
     max_concurrent_fetches = config.MAX_CONCURRENT_FETCHES  # Use config
+    current_run_all_update_messages = [] # Initialize list to collect all updates for this user in this run
 
     logger.info(f"Processing user: {username} for data types: {data_types_to_run}")
 
@@ -557,51 +561,62 @@ async def run_refresh_for_user(username, password, data_types_to_run):
                         continue  # Skip caching bad data
 
                 # --- Comparison and Notification Generation ---
-                notifications_generated = []
+                changes_detected_by_compare_func = []
+
                 if compare_func:  # Check if a comparison function is defined
                     try:
                         # Get old data from cache for comparison
                         old_data = get_from_cache(cache_key)
 
-                        # Compare only if old data exists and new data is substantially different
-                        # The comparison function should handle None/empty checks internally
                         if old_data:
-                            # Only compare for specific users if required
-                            if (
-                                config.NOTIFICATION_ENABLED_USERS == "ALL"
-                                or username in config.NOTIFICATION_ENABLED_USERS
-                            ):
+                            # Call compare_func. It will perform its original duties
+                            # (which might include calling its own add_notification for a different system)
+                            # and return a list of [type, description] for items it considered new THIS RUN.
+                            logger.debug(
+                                f"Calling compare_func for {data_type} for {username}"
+                            )
+                            changes_detected_by_compare_func = compare_func(
+                                username, old_data, data_to_cache
+                            )
+
+                            if changes_detected_by_compare_func:
+                                logger.info(
+                                    f"Compare function for {data_type} found {len(changes_detected_by_compare_func)} changes for {username}."
+                                )
                                 logger.debug(
-                                    f"Comparing {data_type} data for {username}"
+                                    f"Changes from compare_func for {username} ({data_type}): {changes_detected_by_compare_func}"
                                 )
-                                notifications_generated = compare_func(
-                                    username, old_data, data_to_cache
-                                )
-                                if notifications_generated:
-                                    # Log count, details logged within compare_func/add_notification
-                                    logger.info(
-                                        f"Generated {len(notifications_generated)} new {data_type} notifications for {username} this run."
-                                    )
-                                    # Log the actual notifications added this run for clarity
-                                    logger.debug(
-                                        f"Notifications added this run for {username} ({data_type}): {notifications_generated}"
-                                    )
-                            else:
-                                logger.debug(
-                                    f"Skipping {data_type} comparison for {username} (not in enabled list)"
-                                )
-                        else:
+
+                                # --- New User-Specific Persistent Notification Logic ---
+                                if username in TARGET_NOTIFICATION_USERS:
+                                    # Collect all formatted messages for this data_type
+                                    for change_item in changes_detected_by_compare_func:
+                                        if isinstance(change_item, list) and len(change_item) == 2:
+                                            category = data_type.capitalize()
+                                            description = change_item[1]
+                                            formatted_msg = f"[{category}] {description}"
+                                            current_run_all_update_messages.append(formatted_msg)
+                                        else:
+                                            logger.warning(f"Unexpected format for change_item from compare_func for {username} ({data_type}): {change_item}")
+                                    # Batch caching will happen after all data_types for this user are processed
+
+                            # The original logging related to config.NOTIFICATION_ENABLED_USERS is largely handled
+                            # within the compare_xxx functions themselves if they call add_notification.
+                            # The previous logging block here for `notifications_generated` is thus redundant
+                            # if compare_func itself logs its actions.
+
+                        else: # if not old_data
                             logger.debug(
                                 f"Skipping {data_type} comparison for {username} (no old data found in cache key {cache_key})"
                             )
 
                     except Exception as e_comp:
                         logger.error(
-                            f"Error comparing {data_type} data for {username}: {e_comp}",
+                            f"Error during {data_type} comparison or new notification processing for {username}: {e_comp}",
                             exc_info=True,
                         )
                         # Decide whether to proceed with caching despite comparison error
-                        # Caching might be desired even if notifications failed
+                        # Caching of main data_type might be desired even if notifications failed
 
                 # --- Caching ---
                 logger.debug(
@@ -626,6 +641,32 @@ async def run_refresh_for_user(username, password, data_types_to_run):
                 user_results[data_type] = (
                     "failed: internal logic error (final_data None)"
                 )
+
+    # --- After processing all data_types for the user, handle consolidated notification caching ---
+    if username in TARGET_NOTIFICATION_USERS:
+        if current_run_all_update_messages:
+            logger.info(f"Collected {len(current_run_all_update_messages)} new user-specific update message(s) for {username} in this run. Preparing batch.")
+            user_notif_cache_key = f"user_notifications_{username}"
+            new_batch_entry = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "messages": current_run_all_update_messages
+            }
+            
+            existing_user_updates = get_from_cache(user_notif_cache_key) or []
+            if not isinstance(existing_user_updates, list):
+                logger.warning(f"Corrupted user notifications cache for {user_notif_cache_key} (type: {type(existing_user_updates)}). Resetting to empty list.")
+                existing_user_updates = []
+
+            updated_user_updates = [new_batch_entry] + existing_user_updates
+            updated_user_updates = updated_user_updates[:MAX_NOTIFICATIONS_LIMIT] # Limit to N batches
+            
+            VERY_LONG_TIMEOUT = 365 * 24 * 60 * 60  # 1 year
+            if set_json_cache(user_notif_cache_key, updated_user_updates, timeout=VERY_LONG_TIMEOUT):
+                logger.info(f"Successfully cached consolidated batch of {len(current_run_all_update_messages)} updates for {username}. Total batches: {len(updated_user_updates)}.")
+            else:
+                logger.error(f"Failed to cache consolidated batch of updates for {username} at key {user_notif_cache_key}")
+        else:
+            logger.info(f"No new user-specific update messages collected for {username} in this run. No batch to cache.")
 
     return user_results
 
