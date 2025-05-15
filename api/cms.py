@@ -8,7 +8,12 @@ import hashlib  # Added for hash generation
 from config import config
 from scraping.core import create_session, make_request
 from utils.auth import validate_credentials_flow, AuthError
-from utils.cache import get_from_cache, set_in_cache, generate_cache_key
+from utils.cache import (
+    get_from_cache, 
+    set_in_cache, 
+    generate_cache_key, 
+    get_pickle_cache
+)
 from utils.helpers import normalize_course_url
 
 # Import specific scraping functions needed
@@ -61,7 +66,8 @@ def get_combined_course_data(
 
     # 1. Check Cache (only if force_refresh is False)
     if not force_refresh:
-        cached_data = get_from_cache(cache_key)
+        # Use get_pickle_cache for cms_content as it's stored pickled
+        cached_data = get_pickle_cache(cache_key)
         if cached_data:
             # Basic validation of cached structure
             if isinstance(cached_data, list) and len(cached_data) > 0:
