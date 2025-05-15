@@ -4,6 +4,7 @@ import json
 import logging
 import base64  # For simple binary caching
 import time
+import pickle
 
 from config import config  # Import the singleton instance
 
@@ -178,4 +179,32 @@ def get_binary_simple(cache_key: str) -> bytes | None:
         logger.error(
             f"Error reading binary cache (simple) for {cache_key}: {e}", exc_info=True
         )
+    return None
+
+
+def get_pickle_cache(key: str):
+    """Retrieves and unpickles data from Redis cache."""
+    if not redis_client:
+        logger.warning("Redis client not available, cannot get from pickle cache.")
+        return None
+    try:
+        cached_bytes = redis_client.get(key.encode("utf-8"))
+        if cached_bytes:
+            try:
+                return pickle.loads(cached_bytes)
+            except pickle.UnpicklingError as e:
+                logger.error(
+                    f"[Cache] Error unpickling data for key '{key}': {e}. Data: {cached_bytes[:100]!r}"
+                )
+                # Optionally delete corrupted key
+                # delete_from_cache(key)
+                return None
+            except Exception as e_unpickle: # Catch other potential unpickling issues
+                logger.error(f"[Cache] General error unpickling key '{key}': {e_unpickle}", exc_info=True)
+                return None
+        return None
+    except redis.exceptions.ConnectionError as e:
+        logger.error(f"[Cache] Redis connection error on get (pickle) '{key}': {e}")
+    except Exception as e:
+        logger.error(f"[Cache] Error getting key (pickle) '{key}': {e}", exc_info=True)
     return None
