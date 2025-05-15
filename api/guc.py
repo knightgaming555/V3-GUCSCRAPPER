@@ -1,13 +1,15 @@
 # api/guc.py
 import logging
 import json  # Keep for JSON handling
+import re # Added for parsing notification strings
+from datetime import datetime # Added for timestamp parsing
 
 # No asyncio needed here anymore
 from flask import Blueprint, request, jsonify, g
 import time  # For perf_counter timing logs
 
 from config import config
-from utils.auth import validate_credentials_flow, AuthError
+from utils.auth import validate_credentials_flow, AuthError, user_has_stored_credentials, delete_user_credentials
 from utils.cache import get_from_cache, set_in_cache, generate_cache_key
 
 # Import the *synchronous* scraper function (or its alias)
@@ -39,6 +41,7 @@ except ImportError:
 
 
 CACHE_PREFIX = "guc_data"  # Use consistent prefix
+TARGET_NOTIFICATION_USERS = ["mohamed.elsaadi", "seif.elkady"] # For user-specific notifications
 
 
 # Change from async def to def
@@ -124,6 +127,22 @@ def api_guc_data():
             g.log_error_message = (
                 f"Incorrect version. Required: {current_version}, Got: {req_version}"
             )
+
+            # If this is a first-time login attempt with incorrect version
+            if first_time:
+                logger.warning(
+                    f"First-time login with incorrect version for {username}. Credentials will not be saved."
+                )
+
+                # Check if credentials were already saved for this user (from a previous attempt)
+                # and delete them if they exist
+                if user_has_stored_credentials(username):
+                    logger.warning(
+                        f"Found existing credentials for first-time user {username} with incorrect version. Deleting them."
+                    )
+                    delete_user_credentials(username)
+                    logger.info(f"Deleted credentials for first-time user {username} with incorrect version.")
+
             return (
                 jsonify(
                     {
@@ -152,18 +171,78 @@ def api_guc_data():
             g.log_outcome = "cache_hit"
             dev_announce_start_time = time.perf_counter()
             try:
-                # Use memory-cached getter for announcement
                 dev_announcement = get_dev_announcement_cached()
-                if isinstance(cached_data.get("notifications"), list):
-                    if not any(
-                        n.get("id") == dev_announcement.get("id")
-                        for n in cached_data["notifications"]
-                    ):
-                        cached_data["notifications"].insert(0, dev_announcement)
-                else:
-                    cached_data["notifications"] = [dev_announcement]
+                original_guc_notifications = cached_data.pop("notifications", []) # Get and remove original GUC notifications
+                if not isinstance(original_guc_notifications, list):
+                    original_guc_notifications = []
+                
+                # Prepare user-specific notifications (or placeholder)
+                user_specific_notifications_structured = [] # This will hold the single card, or be empty if no card
+                if username in TARGET_NOTIFICATION_USERS:
+                    user_notif_cache_key = f"user_notifications_{username}"
+                    fetched_user_updates_batches = get_from_cache(user_notif_cache_key) or []
+                    logger.info(f"Attempting to fetch user-specific notification batches for {username} from key: {user_notif_cache_key}")
+                    if fetched_user_updates_batches:
+                        logger.info(f"Found {len(fetched_user_updates_batches)} batch(es) of user-specific notifications for {username}.")
+                    else:
+                        logger.info(f"No user-specific notification batches found in cache for {username}.")
+
+                    if isinstance(fetched_user_updates_batches, list) and fetched_user_updates_batches:
+                        latest_batch = fetched_user_updates_batches[0] # Get the most recent batch
+                        if isinstance(latest_batch, dict) and latest_batch.get("messages") and latest_batch.get("timestamp"):
+                            messages_body = "\n".join(latest_batch["messages"])
+                            timestamp_str = latest_batch["timestamp"]
+                            try:
+                                dt_obj = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M")
+                                formatted_date = dt_obj.strftime("%m/%d/%Y")
+                                formatted_email_time = dt_obj.strftime("%Y-%m-%dT%H:%M:%S")
+                            except ValueError:
+                                formatted_date = timestamp_str # fallback
+                                formatted_email_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%S") # fallback to now if timestamp unparseable
+
+                            user_specific_notifications_structured.append({
+                                "id": str(800000), # Dedicated ID for the consolidated user updates card
+                                "title": "Your Updates",
+                                "subject": f"Latest updates as of {formatted_date}",
+                                "body": messages_body,
+                                "date": formatted_date,
+                                "email_time": formatted_email_time,
+                                "staff": "Unisight System",
+                                "importance": "Normal"
+                            })
+                        else:
+                            logger.warning(f"Latest batch for {username} has unexpected format: {latest_batch}")
+                            # Potentially add placeholder if latest batch is corrupt but others exist?
+                            # For now, if latest is bad, we'll fall through to placeholder if this list remains empty.
+                    
+                    # If after trying to process batches, list is still empty, add placeholder
+                    if not user_specific_notifications_structured:
+                        now = datetime.now()
+                        user_specific_notifications_structured.append({
+                            "id": str(777777),
+                            "title": "No New Updates", 
+                            "subject": "No new notifications for you at this time.", 
+                            "body": "Nothing new to see here!", 
+                            "date": now.strftime("%m/%d/%Y"),
+                            "email_time": now.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "staff": "Unisight System",
+                            "importance": "Normal"
+                        })
+                
+                # Construct final notifications list in desired order
+                final_notifications_list = []
+                if dev_announcement: # Ensure dev_announcement is not None
+                     # Avoid adding duplicate dev_announcement if it was already in original_guc_notifications
+                    if not any(n.get("id") == dev_announcement.get("id") for n in original_guc_notifications):
+                        final_notifications_list.append(dev_announcement)
+                
+                final_notifications_list.extend(user_specific_notifications_structured) # Add user-specific (or placeholder)
+                final_notifications_list.extend(original_guc_notifications) # Add original GUC notifications
+                
+                cached_data["notifications"] = final_notifications_list
+
             except Exception as e:
-                logger.error(f"Failed to add dev announcement to cached guc_data: {e}")
+                logger.error(f"Failed to add dev announcement or user-specific notifications to cached guc_data: {e}")
             dev_announce_duration = (
                 time.perf_counter() - dev_announce_start_time
             ) * 1000
@@ -190,9 +269,11 @@ def api_guc_data():
             error_msg = scrape_result["error"]
             logger.error(f"GUC data scraping error for {username}: {error_msg}")
             g.log_error_message = error_msg
-            if "Authentication failed" in error_msg:
+            if "Authentication failed" in error_msg or "auth" in error_msg.lower() or "login failed" in error_msg.lower() or "credentials" in error_msg.lower() or "password" in error_msg.lower():
                 g.log_outcome = "scrape_auth_error"
                 status_code = 401
+                # Standardize the error message for authentication failures
+                error_msg = "Invalid credentials"
             elif any(
                 e in error_msg.lower()
                 for e in ["network", "fetch", "timeout", "connection", "pycurl"]
@@ -236,12 +317,77 @@ def api_guc_data():
             dev_announce_start_time = time.perf_counter()
             try:
                 dev_announcement = get_dev_announcement_cached()
-                if isinstance(scrape_result.get("notifications"), list):
-                    scrape_result["notifications"].insert(0, dev_announcement)
-                else:
-                    scrape_result["notifications"] = [dev_announcement]
+                original_guc_notifications = scrape_result.pop("notifications", []) # Get and remove original GUC notifications
+                if not isinstance(original_guc_notifications, list):
+                    original_guc_notifications = []
+
+                # Prepare user-specific notifications (or placeholder)
+                user_specific_notifications_structured = [] # This will hold the single card, or be empty if no card
+                if username in TARGET_NOTIFICATION_USERS:
+                    user_notif_cache_key = f"user_notifications_{username}"
+                    fetched_user_updates_batches = get_from_cache(user_notif_cache_key) or []
+                    logger.info(f"Attempting to fetch user-specific notification batches for {username} from key: {user_notif_cache_key}")
+                    if fetched_user_updates_batches:
+                        logger.info(f"Found {len(fetched_user_updates_batches)} batch(es) of user-specific notifications for {username}.")
+                    else:
+                        logger.info(f"No user-specific notification batches found in cache for {username}.")
+
+                    if isinstance(fetched_user_updates_batches, list) and fetched_user_updates_batches:
+                        latest_batch = fetched_user_updates_batches[0] # Get the most recent batch
+                        if isinstance(latest_batch, dict) and latest_batch.get("messages") and latest_batch.get("timestamp"):
+                            messages_body = "\n".join(latest_batch["messages"])
+                            timestamp_str = latest_batch["timestamp"]
+                            try:
+                                dt_obj = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M")
+                                formatted_date = dt_obj.strftime("%m/%d/%Y")
+                                formatted_email_time = dt_obj.strftime("%Y-%m-%dT%H:%M:%S")
+                            except ValueError:
+                                formatted_date = timestamp_str # fallback
+                                formatted_email_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%S") # fallback to now if timestamp unparseable
+
+                            user_specific_notifications_structured.append({
+                                "id": str(800000), # Dedicated ID for the consolidated user updates card
+                                "title": "Your Updates",
+                                "subject": f"Latest updates as of {formatted_date}",
+                                "body": messages_body,
+                                "date": formatted_date,
+                                "email_time": formatted_email_time,
+                                "staff": "Unisight System",
+                                "importance": "Normal"
+                            })
+                        else:
+                            logger.warning(f"Latest batch for {username} has unexpected format: {latest_batch}")
+                            # Potentially add placeholder if latest batch is corrupt but others exist?
+                            # For now, if latest is bad, we'll fall through to placeholder if this list remains empty.
+                    
+                    # If after trying to process batches, list is still empty, add placeholder
+                    if not user_specific_notifications_structured:
+                        now = datetime.now()
+                        user_specific_notifications_structured.append({
+                            "id": str(777777),
+                            "title": "No New Updates", 
+                            "subject": "No new notifications for you at this time.", 
+                            "body": "Nothing new to see here!", 
+                            "date": now.strftime("%m/%d/%Y"),
+                            "email_time": now.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "staff": "Unisight System",
+                            "importance": "Normal"
+                        })
+                
+                # Construct final notifications list in desired order
+                final_notifications_list = []
+                if dev_announcement: # Ensure dev_announcement is not None
+                    # Avoid adding duplicate dev_announcement if it was already in original_guc_notifications
+                    if not any(n.get("id") == dev_announcement.get("id") for n in original_guc_notifications):
+                        final_notifications_list.append(dev_announcement)
+                
+                final_notifications_list.extend(user_specific_notifications_structured) # Add user-specific (or placeholder)
+                final_notifications_list.extend(original_guc_notifications) # Add original GUC notifications
+                
+                scrape_result["notifications"] = final_notifications_list
+
             except Exception as e:
-                logger.error(f"Failed to add dev announcement to scraped guc_data: {e}")
+                logger.error(f"Failed to add dev announcement or user-specific notifications to scraped guc_data: {e}")
             dev_announce_duration = (
                 time.perf_counter() - dev_announce_start_time
             ) * 1000
@@ -264,6 +410,18 @@ def api_guc_data():
         )
         g.log_outcome = "internal_error_unhandled"
         g.log_error_message = f"Unhandled exception: {e}"
+
+        # Check if the exception message contains authentication failure indicators
+        error_msg = str(e).lower()
+        if "auth" in error_msg or "login failed" in error_msg or "credentials" in error_msg or "password" in error_msg:
+            logger.warning(f"Authentication error detected in exception: {e}")
+            return (
+                jsonify(
+                    {"status": "error", "message": "Invalid credentials"}
+                ),
+                401,
+            )
+
         return (
             jsonify(
                 {"status": "error", "message": "An internal server error occurred"}
