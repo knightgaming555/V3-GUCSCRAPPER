@@ -72,16 +72,15 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)  # Quieten noisy librarie
 # --- Pickle Caching for CMS Content (Matches refresh_cms_content-2.py) ---
 # Use separate functions for pickle cache to avoid conflicts with JSON cache client settings
 def set_pickle_cache(key: str, value, timeout: int = config.CACHE_DEFAULT_TIMEOUT):
-    raw_redis_client = redis.Redis(
-        host=config.REDIS_HOST,
-        port=config.REDIS_PORT,
-        db=config.REDIS_DB,
-        password=config.REDIS_PASSWORD,
-        decode_responses=False,  # Important: Do not decode for pickle
-    )
+    raw_redis_client = None
     try:
+        # Use from_url to correctly parse REDIS_URL
+        raw_redis_client = redis.Redis.from_url(
+            config.REDIS_URL, 
+            db=config.REDIS_DB if hasattr(config, 'REDIS_DB') else 0, # from_url might handle db in URL, but explicit is safer if REDIS_DB is ever defined separately
+            decode_responses=False # Important: Do not decode for pickle
+        )
         pickled_value = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
-        # Key needs to be bytes for this client
         raw_redis_client.setex(key.encode("utf-8"), timeout, pickled_value)
         logger.info(f"Set PICKLE cache for key {key} with expiry {timeout} seconds")
         return True
