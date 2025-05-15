@@ -3,6 +3,7 @@ import logging
 import json
 from flask import Blueprint, request, jsonify, g
 import concurrent.futures  # To run scraping tasks
+import hashlib  # Added for hash generation
 
 from config import config
 from scraping.core import create_session, make_request
@@ -52,9 +53,11 @@ def get_combined_course_data(
         logger.error(f"Invalid course URL for combined data: {course_url}")
         return {"error": "Invalid course URL provided."}
 
-    cache_key = generate_cache_key(
-        CMS_COURSE_DATA_CACHE_PREFIX, username, normalized_url
-    )
+    # Generate cache key consistent with refresh_cache.py for cms_content
+    # Key format: "cms_content:{hash_of_username_and_normalized_url}"
+    key_string_for_hash = f"{username}:{normalized_url}"
+    hash_value = hashlib.md5(key_string_for_hash.encode("utf-8")).hexdigest()
+    cache_key = f"{CMS_COURSE_DATA_CACHE_PREFIX}:{hash_value}"
 
     # 1. Check Cache (only if force_refresh is False)
     if not force_refresh:
