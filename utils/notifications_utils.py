@@ -1,10 +1,50 @@
 # utils/notifications_utils.py
 import logging
-from api.notifications import add_notification, MAX_NOTIFICATIONS
-from utils.cache import get_from_cache, generate_cache_key
+# from api.notifications import add_notification, MAX_NOTIFICATIONS # REMOVE THIS LINE
+from utils.cache import get_from_cache, generate_cache_key, set_in_cache # Added set_in_cache
 import re  # Keep regex import
+from config import config # Import config for timeout values
 
 logger = logging.getLogger(__name__)
+
+MAX_NOTIFICATIONS = 10  # Define the constant here, adjust value as needed
+
+def add_notification(username: str, notification_type: str, description: str) -> bool:
+    """
+    Adds a new notification for a user and stores it in the cache.
+    Notifications are stored as a list of lists: [[type, description], ...]
+    Returns True if successfully added, False otherwise.
+    """
+    if not username or not notification_type or not description:
+        logger.warning("add_notification called with missing parameters.")
+        return False
+
+    cache_key = generate_cache_key("notifications", username) # This is for the *general* notifications
+    existing_notifications = get_from_cache(cache_key) or []
+
+    if not isinstance(existing_notifications, list):
+        logger.warning(f"Invalid existing notifications format for {username} (key: {cache_key}). Resetting to empty list.")
+        existing_notifications = []
+
+    # Avoid duplicate descriptions for the same type if desired (simple check here)
+    # More sophisticated would be to check type AND description
+    # For now, let's assume compare functions handle not re-adding identical items based on their logic.
+
+    new_notification_item = [str(notification_type), str(description)]
+
+    # Add to the beginning (most recent)
+    updated_notifications = [new_notification_item] + existing_notifications
+
+    # Limit the number of notifications
+    updated_notifications = updated_notifications[:MAX_NOTIFICATIONS]
+
+    # Cache with default timeout
+    if set_in_cache(cache_key, updated_notifications, timeout=config.CACHE_DEFAULT_TIMEOUT):
+        logger.info(f"Added notification for {username}: '{notification_type} - {description}'. Total: {len(updated_notifications)}")
+        return True
+    else:
+        logger.error(f"Failed to cache notification for {username}: '{notification_type} - {description}'")
+        return False
 
 
 # --- Keep _clean_string helper ---
@@ -23,29 +63,31 @@ def _generate_grade_identifier(course_name: str, grade_info: dict) -> tuple | No
     Returns None if essential info is missing.
     Identifier: (Cleaned Course Name, Cleaned Quiz/Assignment Name, Cleaned Grade Value)
     """
-    quiz_name = grade_info.get("Quiz/Assignment", "")
-    grade_value = grade_info.get("grade", "")
+    # Prefer "Element Name" for more specificity, fallback to "Quiz/Assignment"
+    item_name = grade_info.get("Element Name", "").strip()
+    if not item_name:
+        item_name = grade_info.get("Quiz/Assignment", "").strip()
+    
+    grade_value = grade_info.get("grade", "").strip()
 
     # Skip if essential info is missing or grade is just a placeholder "/" or starts with "/"
     if (
-        not quiz_name
+        not item_name # Use item_name here
         or not grade_value
-        or grade_value.strip() == "/"
-        or grade_value.strip().startswith("/")
+        or grade_value == "/" # Simplified check for just "/"
+        or grade_value.startswith("/")
     ):
-        # logger.debug(f"Skipping grade identifier: Course='{course_name}', Quiz='{quiz_name}', Grade='{grade_value}'")
         return None
 
     cleaned_course = _clean_string(course_name)
-    cleaned_quiz = _clean_string(quiz_name)
-    cleaned_grade = _clean_string(grade_value)  # Clean the grade string itself
+    cleaned_item_name = _clean_string(item_name) # Use item_name here
+    cleaned_grade = _clean_string(grade_value)
 
     # Ensure critical components are present after cleaning
-    if not cleaned_course or not cleaned_quiz or not cleaned_grade:
-        # logger.debug(f"Skipping grade identifier due to empty cleaned info: Course='{cleaned_course}', Quiz='{cleaned_quiz}', Grade='{cleaned_grade}'")
+    if not cleaned_course or not cleaned_item_name or not cleaned_grade: # Use cleaned_item_name
         return None
 
-    return (cleaned_course, cleaned_quiz, cleaned_grade)
+    return (cleaned_course, cleaned_item_name, cleaned_grade) # Use cleaned_item_name
 
 
 # --- Keep _generate_attendance_identifier helper ---
