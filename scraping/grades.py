@@ -10,6 +10,13 @@ from config import config  # Import the singleton instance
 
 logger = logging.getLogger(__name__)
 
+# --- Helper function (can be moved to a common utils if used elsewhere) ---
+def _clean_string(text: str) -> str:
+    """Helper to normalize strings for comparison."""
+    if not isinstance(text, str):
+        return ""
+    return " ".join(text.strip().split()) # Collapse whitespace and strip
+
 # --- Grades Parsing Functions ---
 
 
@@ -32,14 +39,9 @@ def _parse_midterm_grades(soup: BeautifulSoup) -> dict:
         cells = row.find_all("td")
         if len(cells) >= 2:
             try:
-                # Clean whitespace and remove potential unwanted characters
-                course_name = (
-                    cells[0].get_text(strip=True).replace("\r", "").replace("\n", " ")
-                )
-                percentage = (
-                    cells[1].get_text(strip=True).replace("\r", "").replace("\n", " ")
-                )
-                if course_name:  # Ensure course name is not empty
+                course_name = _clean_string(cells[0].get_text(strip=True))
+                percentage = _clean_string(cells[1].get_text(strip=True))
+                if course_name:
                     midterm_results[course_name] = percentage
             except Exception as e:
                 logger.error(
@@ -50,7 +52,6 @@ def _parse_midterm_grades(soup: BeautifulSoup) -> dict:
             logger.warning(
                 f"Skipping midterm grade row with insufficient cells ({len(cells)})."
             )
-
     return midterm_results
 
 
@@ -71,11 +72,9 @@ def _parse_subject_codes(soup: BeautifulSoup) -> dict:
 
     for option in options:
         value = option.get("value")
-        text = option.get_text(strip=True)
-        # Skip default/placeholder options (often value="0" or empty)
+        text = _clean_string(option.get_text(strip=True))
         if value and value != "0" and text:
             subject_codes[text] = value
-
     return subject_codes
 
 
@@ -83,118 +82,129 @@ def _extract_detailed_grades_table(soup: BeautifulSoup) -> dict | None:
     """Extracts detailed grades (quizzes, assignments) for a selected subject."""
     detailed_grades = {}
     try:
-        # Find the container div first, then the table inside
         container_div = soup.find(
             "div", id="ContentPlaceHolderright_ContentPlaceHoldercontent_nttTr"
         )
         if not container_div:
-            # Check if the div might be missing but the table exists directly (less common)
             detailed_grades_table = soup.find(
                 "table", id=lambda x: x and "GridViewNtt" in x
-            )  # Alternative ID check
+            ) 
             if not detailed_grades_table:
                 logger.info(
                     "Detailed grades container div '...nttTr' (and fallback table) not found."
                 )
-                return None  # Indicate section not present
+                return None
         else:
             detailed_grades_table = container_div.find("table")
             if not detailed_grades_table:
                 logger.info("Detailed grades container div found, but no table inside.")
-                return None  # Section header present, but no table
+                return None
 
         rows = detailed_grades_table.find_all("tr")
-        if len(rows) <= 1:  # Only header or empty
+        if len(rows) <= 1:
             logger.info("Detailed grades table found but is empty.")
-            return detailed_grades  # Return empty dict for empty table
+            return detailed_grades
 
-        # --- Extract Headers ---
         header_row = rows[0]
         headers_raw = [
             th.get_text(strip=True) for th in header_row.find_all(["th", "td"])
-        ]  # Allow td as header cells too
-        headers = [h for h in headers_raw if h]  # Filter empty headers
+        ]
+        headers = [_clean_string(h) for h in headers_raw if h]
         if not headers:
             logger.warning("Could not extract headers from detailed grades table.")
-            return None  # Cannot process rows without headers
+            return None
 
-        # Expected headers (adjust if needed): "Quiz/Assignment", "Element Name", "Grade"
         try:
-            quiz_col = headers.index("Quiz/Assignment")
-            element_col = headers.index("Element Name")
-            grade_col = headers.index("Grade")
+            # Ensure all expected columns are present by trying to find their indices
+            # These specific names might need adjustment based on actual table headers
+            # For now, assume "Quiz/Assignment", "Element Name", and "Grade" are critical.
+            _ = headers.index("Quiz/Assignment") 
+            _ = headers.index("Element Name")
+            _ = headers.index("Grade")
         except ValueError:
             logger.warning(
-                f"Missing expected headers in detailed grades table. Found: {headers}"
+                f"Missing one or more expected headers (Quiz/Assignment, Element Name, Grade) in detailed grades table. Found: {headers}"
             )
-            return None  # Cannot process if essential columns are missing
+            return None 
 
-        # --- Extract Rows ---
-        row_counter = 0  # To generate unique keys if element names repeat
-        for row in rows[1:]:  # Skip header row
+        item_occurrence_counter = {} # To handle potential duplicate (quiz_name, element_name) keys
+
+        for row in rows[1:]:
             cells = row.find_all("td")
-            if len(cells) == len(headers):  # Ensure row structure matches headers
+            if len(cells) == len(headers):
                 try:
                     row_data = {
-                        headers[i]: cells[i].get_text(strip=True)
+                        _clean_string(headers[i]): _clean_string(cells[i].get_text(strip=True))
                         for i in range(len(headers))
                     }
 
-                    quiz_assignment = row_data.get("Quiz/Assignment", "").strip()
-                    element_name = row_data.get("Element Name", "").strip()
-                    grade_value_raw = row_data.get("Grade", "").strip()
-                    # Clean grade value further
-                    grade_value = (
-                        grade_value_raw.replace("\r", "")
-                        .replace("\n", "")
-                        .replace("\t", "")
-                        .strip()
-                    )
+                    quiz_assignment_raw = row_data.get("Quiz/Assignment", "")
+                    element_name_raw = row_data.get("Element Name", "")
+                    grade_value = row_data.get("Grade", "") # Already cleaned by dict comprehension
 
-                    # Handle missing element name (use Quiz/Assignment as fallback?)
-                    if not element_name:
-                        element_name = f"Unnamed_{quiz_assignment}_{row_counter}"
+                    # Consistently generate key parts
+                    cleaned_qa_for_key = _clean_string(quiz_assignment_raw)
+                    key_part_1 = cleaned_qa_for_key if cleaned_qa_for_key else "NO_QUIZ_ASSIGN_NAME"
 
-                    # Create a unique key (prefer element name, add counter for duplicates)
-                    unique_key = f"{element_name}_{row_counter}"
-                    row_counter += 1
+                    cleaned_en_for_key = _clean_string(element_name_raw)
+                    key_part_2 = cleaned_en_for_key if cleaned_en_for_key else "NO_ELEMENT_NAME"
+                    
+                    counter_tuple_key = (key_part_1, key_part_2) # Used to count occurrences of this specific combination
+                    final_string_key: str
 
-                    # --- Parse Grade Value (Score/Total) ---
+                    if key_part_1 == "NO_QUIZ_ASSIGN_NAME" and key_part_2 == "NO_ELEMENT_NAME":
+                        # Fallback for truly anonymous items, using a distinct counter key for these
+                        occurrence = item_occurrence_counter.get(("_ANONYMOUS_INTERNAL_TRACKER_", "_ANONYMOUS_INTERNAL_TRACKER_"), 0)
+                        final_string_key = f"_ANONYMOUS_ROW_::{occurrence}"
+                        item_occurrence_counter[("_ANONYMOUS_INTERNAL_TRACKER_", "_ANONYMOUS_INTERNAL_TRACKER_")] = occurrence + 1
+                    else:
+                        # Count occurrences of this specific (key_part_1, key_part_2) combination
+                        occurrence = item_occurrence_counter.get(counter_tuple_key, 0)
+                        final_string_key = f"{key_part_1}::{key_part_2}::{occurrence}"
+                        item_occurrence_counter[counter_tuple_key] = occurrence + 1
+                    
                     percentage = 0.0
                     out_of = 0.0
                     if grade_value and "/" in grade_value:
                         parts = grade_value.split("/")
                         if len(parts) == 2:
                             try:
-                                percentage = float(parts[0].strip())
-                                out_of = float(parts[1].strip())
+                                score_str = parts[0].strip()
+                                total_str = parts[1].strip()
+                                if score_str: # Only parse if score is not empty
+                                    percentage = float(score_str)
+                                if total_str: # Only parse if total is not empty
+                                    out_of = float(total_str)
                             except ValueError:
+                                # Log original element name if available, otherwise parts of key for context
+                                name_for_log = element_name_raw if element_name_raw else (quiz_assignment_raw if quiz_assignment_raw else "Unknown Item")
                                 logger.warning(
-                                    f"Could not parse grade fraction '{grade_value}' for '{element_name}'. Setting to 0."
+                                    f"Could not parse grade fraction '{grade_value}' for '{name_for_log}'. Setting to 0/0."
                                 )
                                 percentage = 0.0
-                                out_of = 0.0
-                    elif (
-                        grade_value and grade_value != "Undetermined"
-                    ):  # Handle non-fraction grades if needed
+                                out_of = 0.0 # Explicitly set out_of to 0 on parse error
+                        else: # Invalid fraction format e.g. "/" or "1/2/3"
+                             name_for_log = element_name_raw if element_name_raw else (quiz_assignment_raw if quiz_assignment_raw else "Unknown Item")
+                             logger.warning(f"Invalid grade fraction format '{grade_value}' for '{name_for_log}'. Setting to 0/0.")
+                             percentage = 0.0
+                             out_of = 0.0
+                    elif grade_value and grade_value.lower() not in ["undetermined", "", "-"]:
                         try:
-                            # Attempt to parse as a single number (maybe percentage?)
-                            # Adjust logic based on how single grades are represented
                             percentage = float(grade_value)
-                            out_of = 100.0  # Assuming it's a percentage if not a fraction? Risky assumption.
+                            out_of = 0.0 # Or some other default if it's a standalone score without a total
                             logger.debug(
-                                f"Interpreting non-fraction grade '{grade_value}' for '{element_name}' as percentage."
+                                f"Interpreting non-fraction grade '{grade_value}' for '{element_name_raw or quiz_assignment_raw}' as a standalone score."
                             )
                         except ValueError:
                             logger.warning(
-                                f"Non-numeric, non-fraction grade '{grade_value}' for '{element_name}'."
+                                f"Non-numeric, non-fraction grade '{grade_value}' for '{element_name_raw or quiz_assignment_raw}'. Store as is, parsed as 0/0."
                             )
-                            # Keep percentage/out_of as 0
-
-                    detailed_grades[unique_key] = {
-                        "Quiz/Assignment": quiz_assignment,
-                        "Element Name": element_name,
-                        "grade": grade_value,  # Store cleaned raw grade string
+                    # else: grade is undetermined, empty, or placeholder, percentage/out_of remain 0.0
+                    
+                    detailed_grades[final_string_key] = {
+                        "Quiz/Assignment": quiz_assignment_raw, # Store original, uncleaned names for display
+                        "Element Name": element_name_raw,
+                        "grade": grade_value, 
                         "percentage": percentage,
                         "out_of": out_of,
                     }
@@ -207,12 +217,10 @@ def _extract_detailed_grades_table(soup: BeautifulSoup) -> dict | None:
                 logger.warning(
                     f"Skipping detailed grade row - cell count mismatch. Expected {len(headers)}, got {len(cells)}. Row HTML: {row}"
                 )
-
         return detailed_grades
-
     except Exception as e:
         logger.error(f"Error extracting detailed grades table: {e}", exc_info=True)
-        return None  # Indicate failure
+        return None
 
 
 # --- Main Grades Scraping Function ---
@@ -326,26 +334,26 @@ def scrape_grades(username: str, password: str) -> dict | None:
             "ctl00$ctl00$div_position": "0",  # Common hidden field
         }
 
-        # Use ThreadPoolExecutor for concurrent subject requests
-        detailed_grades_results = {}
-        # Adjust workers based on typical number of subjects
+        # Use a ThreadPoolExecutor to fetch detailed grades concurrently
+        # Limit max_workers to avoid overwhelming the server or local resources
+        max_workers_detailed = min(getattr(config, 'MAX_CONCURRENT_FETCHES_PER_SESSION', 5), len(subject_codes))
+        if max_workers_detailed <= 0: # Ensure positive number of workers
+            max_workers_detailed = 1
+
+        detailed_grades_results = {} 
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(len(subject_codes), 5), thread_name_prefix="GradeDetail"
+            max_workers=max_workers_detailed, thread_name_prefix="GradeDetail"
         ) as executor:
             future_to_subject = {}
             for subject_name, subject_code in subject_codes.items():
                 logger.debug(
                     f"Submitting detailed grade fetch for: {subject_name} ({subject_code})"
                 )
-                # Prepare form data specific to this subject
                 form_data = base_form_data.copy()
                 form_data[
                     "ctl00$ctl00$ContentPlaceHolderright$ContentPlaceHoldercontent$smCrsLst"
                 ] = subject_code
-                # Submit the task: make_request needs its own session per thread or careful session handling
-                # For simplicity, we might pass username/password and create session inside task,
-                # or use a thread-local session if optimizing further.
-                # Let's pass necessary info to a wrapper task function.
+                
                 future = executor.submit(
                     _fetch_and_parse_detailed_grades,
                     username,
@@ -359,20 +367,29 @@ def scrape_grades(username: str, password: str) -> dict | None:
             for future in concurrent.futures.as_completed(future_to_subject):
                 subject_name = future_to_subject[future]
                 try:
-                    detailed_result = (
-                        future.result()
-                    )  # Returns dict of detailed grades or None
-                    if detailed_result is not None:  # Can be empty dict {}
+                    # detailed_result is the direct return of _fetch_and_parse_detailed_grades
+                    # It can be: a dict of grades (possibly empty), or None if parsing/fetch failed internally
+                    detailed_result = future.result()
+                    
+                    if detailed_result is not None:
                         detailed_grades_results[subject_name] = detailed_result
+                        # This log is fine if detailed_result is not None, means the task returned a dict.
+                        # It could be an empty dict if the table was empty but parsed, or populated if grades found.
                         logger.info(
-                            f"Successfully got detailed grades for: {subject_name}"
+                            f"Successfully processed detailed grades task for: {subject_name}"
                         )
-                    # else: Failure logged within the task function
+                    else:
+                        # _fetch_and_parse_detailed_grades itself returned None (e.g., request failed, or _extract_detailed_grades_table returned None)
+                        logger.warning(
+                            f"Detailed grades task for {subject_name} returned None. Storing empty dict for stability."
+                        )
+                        detailed_grades_results[subject_name] = {}
                 except Exception as exc:
                     logger.error(
                         f"Fetching detailed grades for {subject_name} generated an exception: {exc}",
                         exc_info=True,
                     )
+                    detailed_grades_results[subject_name] = {} # Ensure structural consistency on exception
 
         all_grades_data["detailed_grades"] = detailed_grades_results
         logger.info(f"Finished fetching detailed grades for {username}.")
