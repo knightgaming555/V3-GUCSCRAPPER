@@ -3,6 +3,7 @@ import logging
 import json  # Keep for JSON handling
 import re # Added for parsing notification strings
 from datetime import datetime # Added for timestamp parsing
+from collections import defaultdict # Added for grouping grades
 
 # No asyncio needed here anymore
 from flask import Blueprint, request, jsonify, g
@@ -42,6 +43,45 @@ except ImportError:
 
 CACHE_PREFIX = "guc_data"  # Use consistent prefix
 TARGET_NOTIFICATION_USERS = ["mohamed.elsaadi", "seif.elkady"] # For user-specific notifications
+
+
+def _beautify_grade_updates_body(messages_list: list[str]) -> str:
+    """
+    Formats a list of grade update strings into a structured, readable format.
+    Groups updates by course and lists items under each course.
+    """
+    if not messages_list:
+        return "No specific updates available."
+
+    courses = defaultdict(list)
+    # Regex to capture:
+    # 1. Category (e.g., "[Grades]") - ignored for now but part of the pattern
+    # 2. Semester/Context (e.g., "General", "Engineering 2nd Semester")
+    # 3. Course Name and Code (e.g., "SM101 Scientific Methods (A1)")
+    # 4. Grade Item detail (e.g., "discussion 1: 3.5/5 (was 3.5 / 5)")
+    # Basic regex: r"^\\[Grades\\] (?:.*?) - (.*?) - (.*)$" - simpler approach is splitting
+    
+    for message in messages_list:
+        parts = message.split(" - ", 2) # Split into 3 parts max based on " - "
+        if len(parts) == 3:
+            # parts[0] is like "[Grades] General"
+            # parts[1] is the course identifier, e.g., "SM101 Scientific Methods (A1)"
+            # parts[2] is the grade detail, e.g., "discussion 1: 3.5/5 (was 3.5 / 5)"
+            course_identifier = parts[1].strip()
+            grade_detail = parts[2].strip()
+            courses[course_identifier].append(grade_detail)
+        else:
+            # Fallback for lines not matching the expected format
+            courses["Miscellaneous Updates"].append(message)
+
+    output_lines = []
+    for course_identifier, items in courses.items():
+        output_lines.append(f"{course_identifier}:")
+        for item in items:
+            output_lines.append(f"  - {item}")
+        output_lines.append("")  # Add a blank line between courses
+
+    return "\\n".join(output_lines).strip()
 
 
 # Change from async def to def
@@ -190,7 +230,13 @@ def api_guc_data():
                     if isinstance(fetched_user_updates_batches, list) and fetched_user_updates_batches:
                         latest_batch = fetched_user_updates_batches[0] # Get the most recent batch
                         if isinstance(latest_batch, dict) and latest_batch.get("messages") and latest_batch.get("timestamp"):
-                            messages_body = "\n".join(latest_batch["messages"])
+                            messages_list = latest_batch["messages"]
+                            # Beautify the messages list
+                            beautified_content = _beautify_grade_updates_body(messages_list)
+                            messages_body = beautified_content
+                            # Append department info if there's actual content
+                            if beautified_content != "No specific updates available.":
+                                messages_body += "\\n\\nDepartment: Unisight System"
                             timestamp_str = latest_batch["timestamp"]
                             try:
                                 dt_obj = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M")
@@ -203,7 +249,7 @@ def api_guc_data():
                             user_specific_notifications_structured.append({
                                 "id": str(800000), # Dedicated ID for the consolidated user updates card
                                 "title": "Your Updates",
-                                "subject": f"Latest updates as of {formatted_date}",
+                                "subject": "Your latest update", # Changed subject line
                                 "body": messages_body,
                                 "date": formatted_date,
                                 "email_time": formatted_email_time,
@@ -222,7 +268,7 @@ def api_guc_data():
                             "id": str(777777),
                             "title": "No New Updates", 
                             "subject": "No new notifications for you at this time.", 
-                            "body": "Nothing new to see here!", 
+                            "body": "Nothing new to see here!\n\nDepartment: Unisight System", # Append department info to placeholder too
                             "date": now.strftime("%m/%d/%Y"),
                             "email_time": now.strftime("%Y-%m-%dT%H:%M:%S"),
                             "staff": "Unisight System",
@@ -335,7 +381,13 @@ def api_guc_data():
                     if isinstance(fetched_user_updates_batches, list) and fetched_user_updates_batches:
                         latest_batch = fetched_user_updates_batches[0] # Get the most recent batch
                         if isinstance(latest_batch, dict) and latest_batch.get("messages") and latest_batch.get("timestamp"):
-                            messages_body = "\n".join(latest_batch["messages"])
+                            messages_list = latest_batch["messages"]
+                            # Beautify the messages list
+                            beautified_content = _beautify_grade_updates_body(messages_list)
+                            messages_body = beautified_content
+                            # Append department info if there's actual content
+                            if beautified_content != "No specific updates available.":
+                                messages_body += "\\n\\nDepartment: Unisight System"
                             timestamp_str = latest_batch["timestamp"]
                             try:
                                 dt_obj = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M")
@@ -348,7 +400,7 @@ def api_guc_data():
                             user_specific_notifications_structured.append({
                                 "id": str(800000), # Dedicated ID for the consolidated user updates card
                                 "title": "Your Updates",
-                                "subject": f"Latest updates as of {formatted_date}",
+                                "subject": "Your latest update", # Changed subject line
                                 "body": messages_body,
                                 "date": formatted_date,
                                 "email_time": formatted_email_time,
@@ -367,7 +419,7 @@ def api_guc_data():
                             "id": str(777777),
                             "title": "No New Updates", 
                             "subject": "No new notifications for you at this time.", 
-                            "body": "Nothing new to see here!", 
+                            "body": "Nothing new to see here!\n\nDepartment: Unisight System", # Append department info to placeholder too
                             "date": now.strftime("%m/%d/%Y"),
                             "email_time": now.strftime("%Y-%m-%dT%H:%M:%S"),
                             "staff": "Unisight System",
