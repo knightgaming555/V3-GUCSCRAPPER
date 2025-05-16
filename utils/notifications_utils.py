@@ -56,80 +56,54 @@ def _clean_string(text: str) -> str:
     return " ".join(text.strip().split())
 
 
-# --- Keep _generate_grade_identifier helper ---
-def _generate_grade_identifier(course_name: str, grade_info: dict) -> tuple | None:
+# --- Keep _generate_grade_item_key helper ---
+def _generate_grade_item_key(course_name: str, grade_info: dict) -> tuple | None:
     """
-    Generates a unique identifier tuple for a grade based on its content.
+    Generates a unique key tuple for a grade item (course and assignment/element name).
     Returns None if essential info is missing.
-    Identifier: (Cleaned Course Name, Cleaned Quiz/Assignment Name, Cleaned Grade Value)
+    Key: (Cleaned Course Name, Cleaned Item Name)
     """
-    # Prefer "Element Name" for more specificity, fallback to "Quiz/Assignment"
     item_name = grade_info.get("Element Name", "").strip()
-    if not item_name:
+    if not item_name: # Fallback to Quiz/Assignment if Element Name is empty
         item_name = grade_info.get("Quiz/Assignment", "").strip()
-    
-    grade_value = grade_info.get("grade", "").strip()
 
-    # Skip if essential info is missing or grade is just a placeholder "/" or starts with "/"
-    if (
-        not item_name # Use item_name here
-        or not grade_value
-        or grade_value == "/" # Simplified check for just "/"
-        or grade_value.startswith("/")
-    ):
+    # An item name is essential for a key
+    if not item_name:
         return None
 
     cleaned_course = _clean_string(course_name)
-    cleaned_item_name = _clean_string(item_name) # Use item_name here
-    cleaned_grade = _clean_string(grade_value)
+    cleaned_item_name = _clean_string(item_name)
 
-    # Ensure critical components are present after cleaning
-    if not cleaned_course or not cleaned_item_name or not cleaned_grade: # Use cleaned_item_name
+    if not cleaned_course or not cleaned_item_name:
         return None
 
-    return (cleaned_course, cleaned_item_name, cleaned_grade) # Use cleaned_item_name
+    return (cleaned_course, cleaned_item_name)
 
 
-# --- Keep _generate_attendance_identifier helper ---
-def _generate_attendance_identifier(
-    course_name: str, session_info: dict
-) -> tuple | None:
+def _generate_attendance_slot_key(course_name: str, session_info: dict) -> tuple | None:
     """
-    Generates a unique identifier tuple for an attendance record based on its content.
-    Accepts an already cleaned course_name.
+    Generates a unique key for an attendance slot (course and session description).
     Returns None if essential info is missing.
-    Identifier: (Cleaned Course Name, Cleaned Session Description, Cleaned Status)
+    Key: (Cleaned Course Name, Cleaned Session Description)
     """
-    # Assume course_name is already cleaned by the caller
-    cleaned_course = course_name
-
-    # The 'session' key holds the descriptive string (e.g., "S25 - CSEN 202...Slot5 - 2h")
-    session_description = session_info.get("session", "")
-    # The 'status' key holds the attendance status (e.g., "Attended", "Absent")
-    status = session_info.get("status", "")
-
-    # Skip if essential info is missing
-    if not session_description or not status:
-        # logger.debug(f"Skipping attendance identifier generation due to missing info: {session_info}")
+    session_description = session_info.get("session", "").strip()
+    if not session_description:
         return None
 
-    # Clean the whole session description string AND the status separately
+    cleaned_course = _clean_string(course_name) # course_name is the raw key from the dict
     cleaned_session_desc = _clean_string(session_description)
-    cleaned_status = _clean_string(status)
 
-    # Ensure critical components are present after cleaning
-    if not cleaned_course or not cleaned_session_desc or not cleaned_status:
-        # logger.debug(f"Skipping attendance identifier generation due to empty cleaned info: course='{cleaned_course}', desc='{cleaned_session_desc}', status='{cleaned_status}'")
+    if not cleaned_course or not cleaned_session_desc:
         return None
+    
+    return (cleaned_course, cleaned_session_desc)
 
-    # Return the tuple containing all three parts
-    return (cleaned_course, cleaned_session_desc, cleaned_status)
 
-
-# --- Keep UPDATED compare_grades ---
+# --- MODIFIED compare_grades ---
 def compare_grades(username, old_data, new_data):
     """
     Compare old and new grades data to detect changes, focusing on content.
+    Uses a stable key (course, item_name) to compare grade values.
     """
     notifications_added_this_run = []
     logger.debug(f"Starting grade comparison for {username}")
@@ -140,452 +114,273 @@ def compare_grades(username, old_data, new_data):
         )
         return notifications_added_this_run
 
-    # --- Notification Cache Setup ---
-    cache_key = generate_cache_key("notifications", username)
-    existing_notifications = get_from_cache(cache_key) or []
+    existing_notifications = get_from_cache(generate_cache_key("notifications", username)) or []
     if not isinstance(existing_notifications, list):
         logger.warning(f"Invalid notification cache format for {username}. Resetting.")
         existing_notifications = []
-    existing_descriptions_in_cache = {
-        notification[1]
-        for notification in existing_notifications
-        if len(notification) == 2
-    }
-    descriptions_added_this_run = set()
-    logger.debug(
-        f"{len(existing_descriptions_in_cache)} existing grade notification descriptions loaded from cache."
-    )
+    
+    # Store descriptions of notifications already sent in this session to avoid duplicates from this specific run.
+    # The main add_notification might also have its own de-duplication based on its cache if needed.
+    descriptions_added_this_session = set()
 
-    # --- Midterm Comparison (Normalize course name key) ---
+    # --- Midterm Comparison (largely unchanged, ensure _clean_string is robust) ---
     old_midterms_normalized = {
-        _clean_string(course): _clean_string(grade)
-        for course, grade in old_data.get("midterm_results", {}).items()
-        if isinstance(grade, str)
-    }  # Ensure grade is string
+        _clean_string(course): _clean_string(grade_info.get("grade", "") if isinstance(grade_info, dict) else str(grade_info))
+        for course, grade_info in old_data.get("midterm_results", {}).items()
+    }
     new_midterms_normalized = {
-        _clean_string(course): _clean_string(grade)
-        for course, grade in new_data.get("midterm_results", {}).items()
-        if isinstance(grade, str)
+        _clean_string(course): _clean_string(grade_info.get("grade", "") if isinstance(grade_info, dict) else str(grade_info))
+        for course, grade_info in new_data.get("midterm_results", {}).items()
     }
 
-    for cleaned_course_name, new_grade in new_midterms_normalized.items():
-        old_grade = old_midterms_normalized.get(
-            cleaned_course_name
-        )  # Lookup using cleaned key
-        # Check if grade is new or different, and meaningful (not empty, not '0', not just '/')
-        if (
-            old_grade != new_grade
-            and new_grade
-            and new_grade != "0"
-            and not new_grade.startswith("/")
-        ):
-            notification_type = "New midterm grade"
-            description = (
-                f"{cleaned_course_name}: {new_grade}"  # Use cleaned components
-            )
-            if (
-                description not in existing_descriptions_in_cache
-                and description not in descriptions_added_this_run
-            ):
-                logger.info(
-                    f"Attempting to add midterm grade notification for {username}: {description}"
-                )
+    for cleaned_course_name, new_grade_val in new_midterms_normalized.items():
+        old_grade_val = old_midterms_normalized.get(cleaned_course_name)
+        is_new_or_changed = old_grade_val != new_grade_val
+        is_meaningful_grade = new_grade_val and new_grade_val != "0" and not new_grade_val.startswith("/") and new_grade_val.strip() != ""
+
+        if is_new_or_changed and is_meaningful_grade:
+            notification_type = "New midterm grade" if not old_grade_val or (old_grade_val and old_grade_val.startswith("/")) else "Updated midterm grade"
+            description = f"{cleaned_course_name}: {new_grade_val}"
+            if description not in descriptions_added_this_session:
                 if add_notification(username, notification_type, description):
-                    notifications_added_this_run.append(
-                        [notification_type, description]
-                    )
-                    descriptions_added_this_run.add(description)
-                else:
-                    logger.warning(
-                        f"Failed to add midterm grade notification for {username}: {description}"
-                    )
+                    notifications_added_this_run.append([notification_type, description])
+                    descriptions_added_this_session.add(description)
 
-    # --- Detailed Grades Comparison (Content-Based with Normalized Keys) ---
-    old_detailed = old_data.get("detailed_grades", {})
-    new_detailed = new_data.get("detailed_grades", {})
-    if not isinstance(old_detailed, dict) or not isinstance(new_detailed, dict):
-        logger.warning(
-            f"Detailed grades data format mismatch for {username}. Skipping detailed comparison."
-        )
-        return notifications_added_this_run  # Return any midterm notifications
+    # --- Detailed Grades Comparison (Content-Based with Stable Item Key) ---
+    old_detailed_grades_raw = old_data.get("detailed_grades", {})
+    new_detailed_grades_raw = new_data.get("detailed_grades", {})
 
-    # 1. Build set of old grade identifiers {(cleaned_course, cleaned_quiz, cleaned_grade)}
-    old_grade_identifiers = set()
-    logger.debug("Building old_grade_identifiers set...")
-    for course_name_key, course_grades in old_detailed.items():
-        if not isinstance(course_grades, dict):
-            continue
-        cleaned_course_key = _clean_string(course_name_key)
-        if not cleaned_course_key:
-            continue
-        for grade_info in course_grades.values():  # Iterate values
-            if not isinstance(grade_info, dict):
-                continue
-            # Pass cleaned course key to helper
-            identifier = _generate_grade_identifier(cleaned_course_key, grade_info)
-            if identifier:
-                old_grade_identifiers.add(identifier)
-                # logger.debug(f"Stored old grade identifier: {identifier}")
+    if not isinstance(old_detailed_grades_raw, dict) or not isinstance(new_detailed_grades_raw, dict):
+        logger.warning(f"Detailed grades data format mismatch for {username}. Skipping.")
+        return notifications_added_this_run
 
-    logger.debug(
-        f"Built old_grade_identifiers set with {len(old_grade_identifiers)} entries."
-    )
+    # 1. Build map of old detailed grades: {(course, item_name): cleaned_grade_value}
+    old_grades_map = {}
+    for course_name_key, course_grades in old_detailed_grades_raw.items():
+        if not isinstance(course_grades, dict): continue
+        cleaned_course_name = _clean_string(course_name_key)
+        if not cleaned_course_name: continue
+        for grade_item_details in course_grades.values(): # Iterating dict values
+            if not isinstance(grade_item_details, dict): continue
+            item_key = _generate_grade_item_key(cleaned_course_name, grade_item_details)
+            grade_value = _clean_string(grade_item_details.get("grade", ""))
+            if item_key and grade_value and not grade_value.startswith("/") and grade_value.strip() != "": # Only store if key and meaningful grade exists
+                old_grades_map[item_key] = grade_value
+    
+    logger.debug(f"Built old_grades_map with {len(old_grades_map)} entries for {username}.")
 
-    # 2. Compare new identifiers against old set
-    processed_new_identifiers_this_run = set()
-    logger.debug("Processing new detailed grades...")
-    for course_name_key, course_grades in new_detailed.items():
-        if not isinstance(course_grades, dict):
-            continue
-        cleaned_course_key = _clean_string(course_name_key)
-        if not cleaned_course_key:
-            continue
-        # logger.debug(f"Processing new grades for cleaned course key: '{cleaned_course_key}'")
-        for grade_info in course_grades.values():
-            if not isinstance(grade_info, dict):
-                continue
-            identifier = _generate_grade_identifier(cleaned_course_key, grade_info)
-            if not identifier:
-                continue  # Skip placeholders or missing info
+    # 2. Compare new detailed grades against the old map
+    for course_name_key, course_grades in new_detailed_grades_raw.items():
+        if not isinstance(course_grades, dict): continue
+        cleaned_course_name = _clean_string(course_name_key)
+        if not cleaned_course_name: continue
+        for grade_item_details in course_grades.values(): # Iterating dict values
+            if not isinstance(grade_item_details, dict): continue
+            
+            item_key = _generate_grade_item_key(cleaned_course_name, grade_item_details)
+            if not item_key: continue # Skip if no valid item key can be generated
 
-            # Skip if already processed this exact identifier from new data
-            if identifier in processed_new_identifiers_this_run:
-                continue
-            processed_new_identifiers_this_run.add(identifier)
+            new_grade_value = _clean_string(grade_item_details.get("grade", ""))
+            is_meaningful_new_grade = new_grade_value and not new_grade_value.startswith("/") and new_grade_value.strip() != ""
 
-            # Check if this content-based identifier existed previously
-            if identifier not in old_grade_identifiers:
-                logger.info(
-                    f"New grade detected: Course='{identifier[0]}', Quiz='{identifier[1]}', Grade='{identifier[2]}'"
-                )
+            if not is_meaningful_new_grade:
+                continue # Skip unreleased/empty grades
+
+            course_display_name, item_display_name = item_key # item_key is (cleaned_course, cleaned_item_name)
+
+            old_grade_value = old_grades_map.get(item_key)
+
+            notification_type = ""
+            description = ""
+
+            if old_grade_value is None: # Grade item is entirely new
                 notification_type = "New grade"
-                description = f"{identifier[0]} - {identifier[1]}: {identifier[2]}"  # Use cleaned components
-
-                if (
-                    description not in existing_descriptions_in_cache
-                    and description not in descriptions_added_this_run
-                ):
-                    logger.info(
-                        f"Attempting to add detailed grade notification for {username}: {description}"
-                    )
+                description = f"{course_display_name} - {item_display_name}: {new_grade_value}"
+            elif old_grade_value != new_grade_value: # Grade item existed, but value changed
+                notification_type = "Updated grade"
+                description = f"{course_display_name} - {item_display_name}: {new_grade_value} (was {old_grade_value})"
+            
+            if notification_type and description:
+                 # Avoid duplicate notifications within the same processing run
+                if description not in descriptions_added_this_session:
+                    logger.info(f"Attempting to add detailed grade notification for {username}: {description}")
                     if add_notification(username, notification_type, description):
-                        notifications_added_this_run.append(
-                            [notification_type, description]
-                        )
-                        descriptions_added_this_run.add(description)
+                        notifications_added_this_run.append([notification_type, description])
+                        descriptions_added_this_session.add(description)
                     else:
-                        logger.warning(
-                            f"Failed to add detailed grade notification for {username}: {description}"
-                        )
-                else:
-                    logger.debug(
-                        f"Skipping grade notification (already exists in cache or added this run): {description}"
-                    )
-
-    logger.info(
-        f"Finished grade comparison for {username}. Added {len(notifications_added_this_run)} notifications this run."
-    )
+                        logger.warning(f"Failed to add detailed grade notification for {username}: {description}")
+    
+    logger.debug(f"Finished grade comparison for {username}. Notifications added this run: {len(notifications_added_this_run)}")
     return notifications_added_this_run
 
 
 # --- REVISED compare_attendance ---
 def compare_attendance(username, old_data, new_data):
     """
-    Compare old and new attendance data to detect changes, focusing on content
-    and normalizing keys/strings consistently.
+    Compare old and new attendance data to detect changes.
+    Uses a stable key (course, session_description) to compare status.
     """
     notifications_added_this_run = []
     logger.debug(f"Starting attendance comparison for {username}")
 
-    # --- Basic Type/Structure Validation ---
     if not isinstance(old_data, dict) or not isinstance(new_data, dict):
-        logger.warning(
-            f"Skipping attendance comparison for {username} - invalid data format (old: {type(old_data)}, new: {type(new_data)})"
-        )
+        logger.warning(f"Skipping attendance: invalid data format (old: {type(old_data)}, new: {type(new_data)}) for {username}")
         return notifications_added_this_run
 
-    # --- Notification Cache Setup ---
-    cache_key = generate_cache_key("notifications", username)
-    existing_notifications = get_from_cache(cache_key) or []
-    if not isinstance(existing_notifications, list):
-        logger.warning(f"Invalid notification cache format for {username}. Resetting.")
-        existing_notifications = []
-    existing_descriptions_in_cache = {
-        notification[1]
-        for notification in existing_notifications
-        if len(notification) == 2
-    }
-    descriptions_added_this_run = set()
-    logger.debug(
-        f"{len(existing_descriptions_in_cache)} existing attendance notification descriptions loaded from cache."
-    )
+    descriptions_added_this_session = set()
 
-    # --- Absence Level Comparison (Normalize course name key) ---
-    old_absence_levels_normalized = {
-        _clean_string(course): data.get("absence_level", "")
-        for course, data in old_data.items()
-        if isinstance(data, dict) and isinstance(data.get("absence_level"), str)
-    }
-    new_absence_levels_normalized = {
-        _clean_string(course): data.get("absence_level", "")
-        for course, data in new_data.items()
-        if isinstance(data, dict) and isinstance(data.get("absence_level"), str)
-    }
+    old_attendance_raw = old_data.get("attendance", {})
+    new_attendance_raw = new_data.get("attendance", {})
 
-    for cleaned_course_name, new_level in new_absence_levels_normalized.items():
-        old_level = old_absence_levels_normalized.get(
-            cleaned_course_name, ""
-        )  # Use cleaned key for lookup
-        new_level_cleaned = _clean_string(new_level)
+    if not isinstance(old_attendance_raw, dict) or not isinstance(new_attendance_raw, dict):
+        logger.warning(f"Attendance data structure incorrect for {username}. Skipping.")
+        return notifications_added_this_run
 
-        if (
-            old_level != new_level_cleaned
-            and new_level_cleaned
-            and new_level_cleaned != "No Warning Level"
-        ):
-            notification_type = "Attendance warning"
-            description = f"{cleaned_course_name}: {new_level_cleaned}"
-            if (
-                description not in existing_descriptions_in_cache
-                and description not in descriptions_added_this_run
-            ):
-                logger.info(
-                    f"Attempting to add absence level notification for {username}: {description}"
-                )
-                if add_notification(username, notification_type, description):
-                    notifications_added_this_run.append(
-                        [notification_type, description]
-                    )
-                    descriptions_added_this_run.add(description)
-                else:
-                    logger.warning(
-                        f"Failed to add absence level notification for {username}: {description}"
-                    )
+    old_attendance_map = {}
+    for course_name_from_dict_key, course_sessions in old_attendance_raw.items():
+        if not isinstance(course_sessions, list): continue
+        # Note: course_name_from_dict_key is used to generate the slot_key, which itself will clean it.
+        for session_details in course_sessions:
+            if not isinstance(session_details, dict): continue
+            slot_key = _generate_attendance_slot_key(course_name_from_dict_key, session_details)
+            status = _clean_string(session_details.get("status", ""))
+            if slot_key and status:
+                old_attendance_map[slot_key] = status
+    
+    logger.debug(f"Built old_attendance_map with {len(old_attendance_map)} entries for {username}.")
 
-    # --- Individual Session Comparison (Content-Based with Normalized Keys) ---
-    # 1. Build a map of OLD identifiers: {(cleaned_course, cleaned_session_desc): cleaned_status}
-    old_session_statuses = {}
-    logger.debug("Building old_session_statuses map...")
-    for course_name_key, course_data in old_data.items():
-        if not isinstance(course_data, dict):
-            continue
-        sessions_list = course_data.get("sessions", [])
-        if not isinstance(sessions_list, list):
-            continue
-        cleaned_course_key = _clean_string(course_name_key)
-        if not cleaned_course_key:
-            continue
+    for course_name_from_dict_key, course_sessions in new_attendance_raw.items():
+        if not isinstance(course_sessions, list): continue
+        for session_details in course_sessions:
+            if not isinstance(session_details, dict): continue
+            
+            slot_key = _generate_attendance_slot_key(course_name_from_dict_key, session_details)
+            if not slot_key: continue
 
-        for session_info in sessions_list:
-            if not isinstance(session_info, dict):
-                continue
-            # Pass cleaned course key to helper
-            identifier = _generate_attendance_identifier(
-                cleaned_course_key, session_info
-            )
-            if identifier:
-                session_key = (identifier[0], identifier[1])
-                cleaned_status = identifier[2]
-                old_session_statuses[session_key] = cleaned_status
-                # logger.debug(f"Stored old attendance: Key=('{session_key[0]}', '{session_key[1]}'), Status='{cleaned_status}'")
-            # else:
-            # logger.debug(f"Failed to generate old attendance identifier for session: {session_info} under course key: '{course_name_key}'")
+            new_status = _clean_string(session_details.get("status", ""))
+            if not new_status: continue
 
-    logger.debug(
-        f"Built old_session_statuses map with {len(old_session_statuses)} entries."
-    )
+            course_display_name, session_display_name = slot_key
+            old_status = old_attendance_map.get(slot_key)
+            notification_type = ""
+            description = ""
+            
+            # Define non-noteworthy statuses
+            non_noteworthy_statuses = ["not taken yet", "upcoming", "pending", ""]
 
-    # 2. Iterate through NEW data and compare identifiers/statuses
-    processed_new_session_keys_this_run = (
-        set()
-    )  # Track (course, session_desc) processed from new data
-    logger.debug("Processing new attendance data...")
-    for course_name_key, course_data in new_data.items():
-        if not isinstance(course_data, dict):
-            continue
-        sessions_list = course_data.get("sessions", [])
-        if not isinstance(sessions_list, list):
-            continue
-        cleaned_course_key = _clean_string(course_name_key)
-        if not cleaned_course_key:
-            continue
-
-        # logger.debug(f"Processing {len(sessions_list)} new sessions for cleaned course key: '{cleaned_course_key}' (Original: '{course_name_key}')")
-        for session_info in sessions_list:
-            if not isinstance(session_info, dict):
-                continue
-            # Pass cleaned course key to helper
-            identifier = _generate_attendance_identifier(
-                cleaned_course_key, session_info
-            )
-            if not identifier:
-                # logger.debug(f"Failed to generate new attendance identifier for session: {session_info} under course key: '{course_name_key}'")
-                continue
-
-            session_key = (identifier[0], identifier[1])
-            current_cleaned_status = identifier[2]
-            # logger.debug(f"Processing new attendance: Key=('{session_key[0]}', '{session_key[1]}'), Status='{current_cleaned_status}'")
-
-            # Skip if already processed this exact session key in this run
-            if session_key in processed_new_session_keys_this_run:
-                # logger.debug(f"Skipping already processed session this run: Key=('{session_key[0]}', '{session_key[1]}')")
-                continue
-            processed_new_session_keys_this_run.add(session_key)
-
-            # 3. Check against old statuses using the generated session_key
-            old_cleaned_status = old_session_statuses.get(session_key)
-            # logger.debug(f"Comparing Status: Old='{old_cleaned_status}', New='{current_cleaned_status}' for Key=('{session_key[0]}', '{session_key[1]}')")
-
-            if (
-                old_cleaned_status is None
-                or old_cleaned_status != current_cleaned_status
-            ):
-                change_reason = (
-                    "New session"
-                    if old_cleaned_status is None
-                    else f"Status changed from '{old_cleaned_status}' to '{current_cleaned_status}'"
-                )
-                logger.info(
-                    f"Change detected for attendance Key=('{session_key[0]}', '{session_key[1]}'): {change_reason}"
-                )
-                notification_type = "Attendance update"
-                description = f"{identifier[1]}: {identifier[2]}"  # Use cleaned session desc and status
-                # logger.debug(f"Potential notification description: '{description}'")
-
-                # 4. Check against cached notifications and those added this run
-                if description not in existing_descriptions_in_cache:
-                    if description not in descriptions_added_this_run:
-                        logger.info(
-                            f"Attempting to add notification for {username}: {description}"
-                        )
-                        if add_notification(username, notification_type, description):
-                            notifications_added_this_run.append(
-                                [notification_type, description]
-                            )
-                            descriptions_added_this_run.add(description)
-                        else:
-                            logger.warning(
-                                f"Failed to add attendance notification via add_notification for {username}: {description}"
-                            )
-                    # else:
-                    # logger.debug(f"Skipping notification (already added this run): {description}")
-                # else:
-                # logger.debug(f"Skipping notification (already exists in cache): {description}")
-            # else:
-            # logger.debug(f"No change detected for attendance Key=('{session_key[0]}', '{session_key[1]}')")
-
-    logger.info(
-        f"Finished attendance comparison for {username}. Added {len(notifications_added_this_run)} notifications this run."
-    )
+            if old_status is None:
+                if new_status.lower() not in non_noteworthy_statuses:
+                    notification_type = "New attendance record"
+                    description = f"{course_display_name} - {session_display_name}: {new_status}"
+            elif old_status != new_status:
+                if new_status.lower() not in non_noteworthy_statuses or old_status.lower() not in non_noteworthy_statuses:
+                    notification_type = "Attendance status updated"
+                    description = f"{course_display_name} - {session_display_name}: {new_status} (was {old_status})"
+            
+            if notification_type and description:
+                if description not in descriptions_added_this_session:
+                    logger.info(f"Attempting to add attendance notification for {username}: {description}")
+                    if add_notification(username, notification_type, description):
+                        notifications_added_this_run.append([notification_type, description])
+                        descriptions_added_this_session.add(description)
+                    else:
+                        logger.warning(f"Failed to add attendance notification for {username}: {description}")
+    
+    logger.debug(f"Finished attendance comparison for {username}. Notifications added: {len(notifications_added_this_run)}")
     return notifications_added_this_run
 
 
-# --- Keep UPDATED compare_guc_data ---
+# --- REVISED compare_guc_data ---
 def compare_guc_data(username, old_data, new_data):
     """
-    Compare old and new GUC data (specifically notifications section) to detect changes.
+    Compares old and new GUC data, including student_info, detailed_grades (via compare_grades),
+    and GUC system notifications.
+    Returns a list of notifications generated during this comparison.
     """
     notifications_added_this_run = []
     logger.debug(f"Starting GUC data comparison for {username}")
 
     if not isinstance(old_data, dict) or not isinstance(new_data, dict):
-        logger.warning(
-            f"Skipping GUC data comparison for {username} - invalid data format."
-        )
+        logger.warning(f"Skipping GUC data comparison for {username} - invalid data format.")
         return notifications_added_this_run
 
-    # --- Notification Cache Setup ---
-    cache_key = generate_cache_key("notifications", username)
-    existing_notifications = get_from_cache(cache_key) or []
-    if not isinstance(existing_notifications, list):
-        logger.warning(f"Invalid notification cache format for {username}. Resetting.")
-        existing_notifications = []
-    existing_descriptions_in_cache = {
-        notification[1]
-        for notification in existing_notifications
-        if len(notification) == 2
-    }
-    descriptions_added_this_run = set()
-    logger.debug(
-        f"{len(existing_descriptions_in_cache)} existing GUC notification descriptions loaded from cache."
-    )
+    descriptions_added_this_session = set() # To prevent duplicates in this specific run
 
-    # --- GUC Notification Comparison ---
+    # 1. Compare Student Info (simple field by field)
+    old_student_info = old_data.get("student_info", {})
+    new_student_info = new_data.get("student_info", {})
+    if isinstance(old_student_info, dict) and isinstance(new_student_info, dict):
+        student_info_fields_to_check = ["fullname", "mail", "sg", "advisorname", "status", "studyprogram", "uniqappno"]
+        for field in student_info_fields_to_check:
+            old_val = _clean_string(old_student_info.get(field, ""))
+            new_val = _clean_string(new_student_info.get(field, ""))
+            if old_val != new_val and new_val: # Notify if changed and new value is not empty
+                notification_type = "Student Info Update"
+                description = f"{field.capitalize()} changed to: {new_val}"
+                if old_val: # Include old value if it existed
+                    description += f" (was {old_val})"
+                
+                if description not in descriptions_added_this_session:
+                    if add_notification(username, notification_type, description):
+                        notifications_added_this_run.append([notification_type, description])
+                        descriptions_added_this_session.add(description)
+    else:
+        logger.warning(f"Student info format incorrect for {username}, skipping its comparison.")
+
+    # 2. Compare Grades (detailed_grades and midterm_results) using the specialized compare_grades function
+    # We pass the full old_data and new_data because compare_grades knows to extract the relevant grade parts.
+    grade_notifications = compare_grades(username, old_data, new_data)
+    for nt in grade_notifications: # Add to current run list, compare_grades already uses add_notification
+        if nt[1] not in descriptions_added_this_session: # Ensure no cross-function duplicates for this session
+            notifications_added_this_run.append(nt)
+            descriptions_added_this_session.add(nt[1])
+
+    # 3. Compare GUC System Notifications (list of dicts, use 'id' as stable key)
     old_guc_notifications = old_data.get("notifications", [])
     new_guc_notifications = new_data.get("notifications", [])
 
-    if not isinstance(old_guc_notifications, list):
-        old_guc_notifications = []
-    if not isinstance(new_guc_notifications, list):
-        new_guc_notifications = []
+    if not isinstance(old_guc_notifications, list): old_guc_notifications = []
+    if not isinstance(new_guc_notifications, list): new_guc_notifications = []
 
-    # Build set of old identifiers (id or title)
-    old_notification_identifiers = set()
-    for n in old_guc_notifications:
-        if not isinstance(n, dict):
-            continue
-        notif_id = str(n.get("id", "")).strip()
-        # Clean title *before* using it as an identifier
-        title = _clean_string(n.get("title", "").replace("Notification System:", ""))
-        if notif_id:
-            old_notification_identifiers.add(f"id:{notif_id}")
-        elif title:
-            old_notification_identifiers.add(f"title:{title}")  # Use cleaned title
+    # Create a map of old GUC notifications by their ID for efficient lookup
+    old_guc_notif_map = {}
+    for notif in old_guc_notifications:
+        if isinstance(notif, dict) and notif.get("id") and notif.get("title") and notif.get("subject"):
+             # Check if this notification is a dev announcement or user-specific, skip comparing them here
+            if str(notif.get("id")) == str(config.DEV_ANNOUNCEMENT_ID) or \
+               str(notif.get("id")) == str(config.USER_SPECIFIC_UPDATES_ID) or \
+               str(notif.get("id")) == str(config.USER_SPECIFIC_PLACEHOLDER_ID):
+                continue
+            old_guc_notif_map[str(notif["id"])] = notif
 
-    logger.debug(
-        f"Built old GUC notification identifiers set with {len(old_notification_identifiers)} entries."
-    )
+    for new_notif in new_guc_notifications:
+        if isinstance(new_notif, dict) and new_notif.get("id") and new_notif.get("title") and new_notif.get("subject"):
+            notif_id_str = str(new_notif["id"])
+            
+            # Skip dev announcements & user-specific updates placeholders, they are handled differently by API
+            if notif_id_str == str(config.DEV_ANNOUNCEMENT_ID) or \
+               notif_id_str == str(config.USER_SPECIFIC_UPDATES_ID) or \
+               notif_id_str == str(config.USER_SPECIFIC_PLACEHOLDER_ID):
+                continue
 
-    # Compare new notifications against old set
-    processed_new_guc_notification_ids = set()
-    for notification in new_guc_notifications:
-        if not isinstance(notification, dict):
-            continue
-        notification_id = str(notification.get("id", "")).strip()
-        # Clean title *before* creating description or identifier
-        title = _clean_string(
-            notification.get("title", "").replace("Notification System:", "")
-        )
+            title = _clean_string(new_notif.get("title", "Untitled"))
+            subject = _clean_string(new_notif.get("subject", "No Subject"))
+            # Consider if date, staff also needs to be checked for changes if notif_id is same
+            # For now, primarily detecting NEW notifications by ID.
 
-        if not title:
-            continue  # Skip if no title after cleaning
+            if notif_id_str not in old_guc_notif_map:
+                notification_type = "New GUC Notification"
+                description = f"{title} - {subject}"
+                # Check for placeholder titles/subjects that might indicate no real content
+                if title.lower() == "untitled" and subject.lower() == "no subject":
+                    logger.debug(f"Skipping GUC notification for {username} due to placeholder content: {description}")
+                    continue
+                if description not in descriptions_added_this_session:
+                    if add_notification(username, notification_type, description):
+                        notifications_added_this_run.append([notification_type, description])
+                        descriptions_added_this_session.add(description)
+            # else: Notification ID already seen. Could add logic here to compare content if ID is same but title/subject/body changed.
+            # For now, focusing on new notifications by ID.
 
-        current_identifier_this_run = (
-            f"id:{notification_id}" if notification_id else f"title:{title}"
-        )
-        if current_identifier_this_run in processed_new_guc_notification_ids:
-            continue
-        processed_new_guc_notification_ids.add(current_identifier_this_run)
-
-        if current_identifier_this_run not in old_notification_identifiers:
-            logger.info(
-                f"New GUC notification detected: Identifier='{current_identifier_this_run}', Title='{title}'"
-            )
-            notification_type = "GUC notification"
-            description = title  # Use the cleaned title
-
-            if (
-                description not in existing_descriptions_in_cache
-                and description not in descriptions_added_this_run
-            ):
-                logger.info(
-                    f"Attempting to add GUC notification for {username}: {description}"
-                )
-                if add_notification(username, notification_type, description):
-                    notifications_added_this_run.append(
-                        [notification_type, description]
-                    )
-                    descriptions_added_this_run.add(description)
-                else:
-                    logger.warning(
-                        f"Failed to add GUC notification for {username}: {description}"
-                    )
-            else:
-                logger.debug(
-                    f"Skipping GUC notification (already exists in cache or added this run): {description}"
-                )
-
-    logger.info(
-        f"Finished GUC data comparison for {username}. Added {len(notifications_added_this_run)} notifications this run."
-    )
+    logger.debug(f"Finished GUC data comparison for {username}. Total notifications this run: {len(notifications_added_this_run)}")
     return notifications_added_this_run
