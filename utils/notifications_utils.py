@@ -320,9 +320,9 @@ def compare_guc_data(username, old_data, new_data):
     for notif in old_guc_notifications:
         if isinstance(notif, dict) and notif.get("id") and notif.get("title") and notif.get("subject"):
              # Check if this notification is a dev announcement or user-specific, skip comparing them here
-            if str(notif.get("id")) == str(config.DEV_ANNOUNCEMENT_ID) or \
-               str(notif.get("id")) == str(config.USER_SPECIFIC_UPDATES_ID) or \
-               str(notif.get("id")) == str(config.USER_SPECIFIC_PLACEHOLDER_ID):
+            if str(notif.get("id")) == str(getattr(config, 'DEV_ANNOUNCEMENT_ID', None)) or \
+               str(notif.get("id")) == str(getattr(config, 'USER_SPECIFIC_UPDATES_ID', None)) or \
+               str(notif.get("id")) == str(getattr(config, 'USER_SPECIFIC_PLACEHOLDER_ID', None)):
                 continue
             old_guc_notif_map[str(notif["id"])] = notif
 
@@ -331,9 +331,9 @@ def compare_guc_data(username, old_data, new_data):
             notif_id_str = str(new_notif["id"])
             
             # Skip dev announcements & user-specific updates placeholders, they are handled differently by API
-            if notif_id_str == str(config.DEV_ANNOUNCEMENT_ID) or \
-               notif_id_str == str(config.USER_SPECIFIC_UPDATES_ID) or \
-               notif_id_str == str(config.USER_SPECIFIC_PLACEHOLDER_ID):
+            if notif_id_str == str(getattr(config, 'DEV_ANNOUNCEMENT_ID', None)) or \
+               notif_id_str == str(getattr(config, 'USER_SPECIFIC_UPDATES_ID', None)) or \
+               notif_id_str == str(getattr(config, 'USER_SPECIFIC_PLACEHOLDER_ID', None)):
                 continue
 
             title = _clean_string(new_notif.get("title", "Untitled"))
