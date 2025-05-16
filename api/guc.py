@@ -81,7 +81,7 @@ def _beautify_grade_updates_body(messages_list: list[str]) -> str:
             output_lines.append(f"  - {item}")
         output_lines.append("")  # Add a blank line between courses
 
-    return "\\n".join(output_lines).strip()
+    return "\n".join(output_lines).strip()
 
 
 # Change from async def to def
@@ -236,7 +236,7 @@ def api_guc_data():
                             messages_body = beautified_content
                             # Append department info if there's actual content
                             if beautified_content != "No specific updates available.":
-                                messages_body += "\\n\\nDepartment: Unisight System"
+                                messages_body += "\n\nDepartment: Unisight System"
                             timestamp_str = latest_batch["timestamp"]
                             try:
                                 dt_obj = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M")
@@ -387,7 +387,7 @@ def api_guc_data():
                             messages_body = beautified_content
                             # Append department info if there's actual content
                             if beautified_content != "No specific updates available.":
-                                messages_body += "\\n\\nDepartment: Unisight System"
+                                messages_body += "\n\nDepartment: Unisight System"
                             timestamp_str = latest_batch["timestamp"]
                             try:
                                 dt_obj = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M")
