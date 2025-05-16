@@ -9,42 +9,137 @@ logger = logging.getLogger(__name__)
 
 MAX_NOTIFICATIONS = 10  # Define the constant here, adjust value as needed
 
-def add_notification(username: str, notification_type: str, description: str) -> bool:
-    """
-    Adds a new notification for a user and stores it in the cache.
-    Notifications are stored as a list of lists: [[type, description], ...]
-    Returns True if successfully added, False otherwise.
-    """
-    if not username or not notification_type or not description:
-        logger.warning("add_notification called with missing parameters.")
-        return False
+# --- Constants for Grade Comparison ---
+_PLACEHOLDER_GRADES = ["na", "n/a", "-", "undetermined", "", "/"] # "" for empty, "/" for "/10" like
 
-    cache_key = generate_cache_key("notifications", username) # This is for the *general* notifications
-    existing_notifications = get_from_cache(cache_key) or []
+# --- Helper Functions for Grade Comparison ---
 
-    if not isinstance(existing_notifications, list):
-        logger.warning(f"Invalid existing notifications format for {username} (key: {cache_key}). Resetting to empty list.")
-        existing_notifications = []
-
-    # Avoid duplicate descriptions for the same type if desired (simple check here)
-    # More sophisticated would be to check type AND description
-    # For now, let's assume compare functions handle not re-adding identical items based on their logic.
-
-    new_notification_item = [str(notification_type), str(description)]
-
-    # Add to the beginning (most recent)
-    updated_notifications = [new_notification_item] + existing_notifications
-
-    # Limit the number of notifications
-    updated_notifications = updated_notifications[:MAX_NOTIFICATIONS]
-
-    # Cache with default timeout
-    if set_in_cache(cache_key, updated_notifications, timeout=config.CACHE_DEFAULT_TIMEOUT):
-        logger.info(f"Added notification for {username}: '{notification_type} - {description}'. Total: {len(updated_notifications)}")
+def _is_placeholder_grade(grade_str: str | None) -> bool:
+    """Checks if a grade string is a placeholder or effectively empty."""
+    if grade_str is None:
         return True
+    cleaned = _clean_string(grade_str) # _clean_string handles None by returning ""
+    if not cleaned: return True # Empty after cleaning
+    if cleaned == "/": return True # Common for empty grades like " /10" which clean to "/"
+    # Add more specific GUC placeholders if known, e.g., "Not Graded", "Pending"
+    return cleaned.lower() in _PLACEHOLDER_GRADES
+
+def _get_grade_display_name_from_details(item_details: dict, item_dict_key_from_scraper: str) -> str:
+    """
+    Determines the best display name for a grade item, using its scraped names or falling back to key parts.
+    """
+    raw_qa = item_details.get("Quiz/Assignment", "")
+    raw_en = item_details.get("Element Name", "")
+
+    # Use stripped raw values for display if they have content
+    display_qa = raw_qa.strip()
+    display_en = raw_en.strip()
+
+    if display_qa: # If Quiz/Assignment has meaningful content
+        return display_qa
+    elif display_en: # Else if Element Name has meaningful content
+        return display_en
     else:
-        logger.error(f"Failed to cache notification for {username}: '{notification_type} - {description}'")
-        return False
+        # Fallback if both primary names are empty/whitespace.
+        # Try to derive something from the scraper's key.
+        # Scraper key is like "cleaned_name1::cleaned_name2::occurrence"
+        parts = item_dict_key_from_scraper.split("::")
+        # Prefer the parts that are not placeholders used by the scraper's key generation
+        if len(parts) > 0 and parts[0] not in ["NO_QUIZ_ASSIGN_NAME", "_ANONYMOUS_ROW_"]:
+            return parts[0] 
+        elif len(parts) > 1 and parts[1] != "NO_ELEMENT_NAME":
+            return parts[1]
+        return f"Item ({item_dict_key_from_scraper})" # Ultimate fallback, show the key for context
+
+# --- Main Grade Comparison Logic (Refactored for Index-Based Matching) ---
+def compare_grades(username: str, old_detailed_grades_raw: dict, new_detailed_grades_raw: dict) -> list:
+    """
+    Compares old and new detailed grades based on item order within each course.
+    Notifications are triggered for actual grade value changes or new (non-placeholder) grades.
+    Name changes alone at the same position do not trigger notifications if the grade value is identical.
+    """
+    notifications = []
+    if not isinstance(old_detailed_grades_raw, dict) or not isinstance(new_detailed_grades_raw, dict):
+        # Handle cases where entire grade sets might be missing (e.g., initial scrape error)
+        # Depending on desired behavior, could log or create a general notification.
+        # For now, if either is not a dict, assume no comparison possible or no old data.
+        # If new_detailed_grades_raw IS a dict, all its non-placeholder items would appear "New".
+        if isinstance(new_detailed_grades_raw, dict) and not isinstance(old_detailed_grades_raw, dict):
+             for course_name_raw, new_course_items_dict in new_detailed_grades_raw.items():
+                if not isinstance(new_course_items_dict, dict): continue
+                cleaned_course_name_for_new = _clean_string(course_name_raw)
+                if not cleaned_course_name_for_new: continue
+                for item_dict_key_new, new_item_details in new_course_items_dict.items():
+                    if not isinstance(new_item_details, dict): continue
+                    new_grade_raw = new_item_details.get("grade")
+                    if not _is_placeholder_grade(new_grade_raw):
+                        current_item_display_name_new = _get_grade_display_name_from_details(new_item_details, item_dict_key_new)
+                        new_grade_cleaned_for_notif = _clean_string(new_grade_raw)
+                        notif_desc = f"{cleaned_course_name_for_new} - {current_item_display_name_new}: {new_grade_cleaned_for_notif}"
+                        notifications.append(["New grade", notif_desc])
+        return notifications
+
+
+    # 1. Build map of old detailed grades: {(course_name, list_index): (cleaned_grade_value, display_name_of_old_item)}
+    old_grades_map_by_index = {}
+    for course_name_raw, old_course_items_dict in old_detailed_grades_raw.items():
+        if not isinstance(old_course_items_dict, dict): continue
+        cleaned_course_name_for_map = _clean_string(course_name_raw)
+        if not cleaned_course_name_for_map: continue
+
+        # old_course_items_dict.items() gives (item_dict_key_from_scraper, item_details)
+        # We rely on dict insertion order being preserved from scraping.
+        for list_idx, (item_dict_key_old, old_item_details) in enumerate(old_course_items_dict.items()):
+            if not isinstance(old_item_details, dict): continue
+            
+            map_key = (cleaned_course_name_for_map, list_idx)
+            
+            old_grade_raw = old_item_details.get("grade")
+            if _is_placeholder_grade(old_grade_raw): # Skip adding old placeholders to the map
+                continue
+
+            # Store the *cleaned* grade in the map if it's not a placeholder
+            old_grade_cleaned = _clean_string(old_grade_raw)
+            item_display_name_old = _get_grade_display_name_from_details(old_item_details, item_dict_key_old)
+            old_grades_map_by_index[map_key] = (old_grade_cleaned, item_display_name_old)
+
+    # 2. Iterate through new detailed grades, comparing with old map by course and list index
+    for course_name_raw, new_course_items_dict in new_detailed_grades_raw.items():
+        if not isinstance(new_course_items_dict, dict): continue
+        cleaned_course_name_for_new = _clean_string(course_name_raw)
+        if not cleaned_course_name_for_new: continue
+
+        for list_idx, (item_dict_key_new, new_item_details) in enumerate(new_course_items_dict.items()):
+            if not isinstance(new_item_details, dict): continue
+
+            current_comparison_key = (cleaned_course_name_for_new, list_idx)
+            
+            new_grade_raw = new_item_details.get("grade")
+            new_grade_cleaned_for_notif = _clean_string(new_grade_raw) # Cleaned version for display & comparison
+            current_item_display_name_new = _get_grade_display_name_from_details(new_item_details, item_dict_key_new)
+
+            is_new_grade_placeholder = _is_placeholder_grade(new_grade_raw)
+
+            if current_comparison_key in old_grades_map_by_index:
+                old_grade_from_map, _old_item_display_name = old_grades_map_by_index[current_comparison_key]
+                # old_grade_from_map is already cleaned and verified not to be a placeholder.
+
+                if is_new_grade_placeholder:
+                    # New grade is placeholder, old grade (from map) was real. This is a change: grade cleared.
+                    notif_desc = f"{cleaned_course_name_for_new} - {current_item_display_name_new}: (grade removed/cleared, was {old_grade_from_map})"
+                    notifications.append(["Updated grade", notif_desc])
+                elif new_grade_cleaned_for_notif != old_grade_from_map:
+                    # New grade is real, old grade was real. Compare values.
+                    notif_desc = f"{cleaned_course_name_for_new} - {current_item_display_name_new}: {new_grade_cleaned_for_notif} (was {old_grade_from_map})"
+                    notifications.append(["Updated grade", notif_desc])
+                # If new_grade_cleaned_for_notif == old_grade_from_map (and new is not placeholder), no change in value, no notification.
+                    
+            else: # New item at this list index (e.g., course is new, or list of grades for this course is longer)
+                if not is_new_grade_placeholder: # Only notify if the new item has a real, non-placeholder grade
+                    notif_desc = f"{cleaned_course_name_for_new} - {current_item_display_name_new}: {new_grade_cleaned_for_notif}"
+                    notifications.append(["New grade", notif_desc])
+       
+    return notifications
 
 
 # --- Keep _clean_string helper ---
@@ -56,28 +151,21 @@ def _clean_string(text: str) -> str:
     return " ".join(text.strip().split())
 
 
-# --- Keep _generate_grade_item_key helper ---
-def _generate_grade_item_key(course_name: str, grade_info: dict) -> tuple | None:
+# --- MODIFIED _generate_grade_item_key helper ---
+def _generate_grade_item_key(course_name: str, grade_item_dict_key: str) -> tuple | None:
     """
-    Generates a unique key tuple for a grade item (course and assignment/element name).
+    Generates a unique key tuple for a grade item using its course name and its dictionary key.
     Returns None if essential info is missing.
-    Key: (Cleaned Course Name, Cleaned Item Name)
+    Key: (Cleaned Course Name, Grade Item Dictionary Key)
     """
-    item_name = grade_info.get("Element Name", "").strip()
-    if not item_name: # Fallback to Quiz/Assignment if Element Name is empty
-        item_name = grade_info.get("Quiz/Assignment", "").strip()
+    cleaned_course_name = _clean_string(course_name)
+    # Ensure grade_item_dict_key is a string and not empty
+    cleaned_dict_key = str(grade_item_dict_key).strip()
 
-    # An item name is essential for a key
-    if not item_name:
+    if not cleaned_course_name or not cleaned_dict_key:
         return None
 
-    cleaned_course = _clean_string(course_name)
-    cleaned_item_name = _clean_string(item_name)
-
-    if not cleaned_course or not cleaned_item_name:
-        return None
-
-    return (cleaned_course, cleaned_item_name)
+    return (cleaned_course_name, cleaned_dict_key)
 
 
 def _generate_attendance_slot_key(course_name: str, session_info: dict) -> tuple | None:
@@ -97,121 +185,6 @@ def _generate_attendance_slot_key(course_name: str, session_info: dict) -> tuple
         return None
     
     return (cleaned_course, cleaned_session_desc)
-
-
-# --- MODIFIED compare_grades ---
-def compare_grades(username, old_data, new_data):
-    """
-    Compare old and new grades data to detect changes, focusing on content.
-    Uses a stable key (course, item_name) to compare grade values.
-    """
-    notifications_added_this_run = []
-    logger.debug(f"Starting grade comparison for {username}")
-
-    if not isinstance(old_data, dict) or not isinstance(new_data, dict):
-        logger.warning(
-            f"Skipping grades comparison for {username} - invalid data format (old: {type(old_data)}, new: {type(new_data)})"
-        )
-        return notifications_added_this_run
-
-    existing_notifications = get_from_cache(generate_cache_key("notifications", username)) or []
-    if not isinstance(existing_notifications, list):
-        logger.warning(f"Invalid notification cache format for {username}. Resetting.")
-        existing_notifications = []
-    
-    # Store descriptions of notifications already sent in this session to avoid duplicates from this specific run.
-    # The main add_notification might also have its own de-duplication based on its cache if needed.
-    descriptions_added_this_session = set()
-
-    # --- Midterm Comparison (largely unchanged, ensure _clean_string is robust) ---
-    old_midterms_normalized = {
-        _clean_string(course): _clean_string(grade_info.get("grade", "") if isinstance(grade_info, dict) else str(grade_info))
-        for course, grade_info in old_data.get("midterm_results", {}).items()
-    }
-    new_midterms_normalized = {
-        _clean_string(course): _clean_string(grade_info.get("grade", "") if isinstance(grade_info, dict) else str(grade_info))
-        for course, grade_info in new_data.get("midterm_results", {}).items()
-    }
-
-    for cleaned_course_name, new_grade_val in new_midterms_normalized.items():
-        old_grade_val = old_midterms_normalized.get(cleaned_course_name)
-        is_new_or_changed = old_grade_val != new_grade_val
-        is_meaningful_grade = new_grade_val and new_grade_val != "0" and not new_grade_val.startswith("/") and new_grade_val.strip() != ""
-
-        if is_new_or_changed and is_meaningful_grade:
-            notification_type = "New midterm grade" if not old_grade_val or (old_grade_val and old_grade_val.startswith("/")) else "Updated midterm grade"
-            description = f"{cleaned_course_name}: {new_grade_val}"
-            if description not in descriptions_added_this_session:
-                if add_notification(username, notification_type, description):
-                    notifications_added_this_run.append([notification_type, description])
-                    descriptions_added_this_session.add(description)
-
-    # --- Detailed Grades Comparison (Content-Based with Stable Item Key) ---
-    old_detailed_grades_raw = old_data.get("detailed_grades", {})
-    new_detailed_grades_raw = new_data.get("detailed_grades", {})
-
-    if not isinstance(old_detailed_grades_raw, dict) or not isinstance(new_detailed_grades_raw, dict):
-        logger.warning(f"Detailed grades data format mismatch for {username}. Skipping.")
-        return notifications_added_this_run
-
-    # 1. Build map of old detailed grades: {(course, item_name): cleaned_grade_value}
-    old_grades_map = {}
-    for course_name_key, course_grades in old_detailed_grades_raw.items():
-        if not isinstance(course_grades, dict): continue
-        cleaned_course_name = _clean_string(course_name_key)
-        if not cleaned_course_name: continue
-        for grade_item_details in course_grades.values(): # Iterating dict values
-            if not isinstance(grade_item_details, dict): continue
-            item_key = _generate_grade_item_key(cleaned_course_name, grade_item_details)
-            grade_value = _clean_string(grade_item_details.get("grade", ""))
-            if item_key and grade_value and not grade_value.startswith("/") and grade_value.strip() != "": # Only store if key and meaningful grade exists
-                old_grades_map[item_key] = grade_value
-    
-    logger.debug(f"Built old_grades_map with {len(old_grades_map)} entries for {username}.")
-
-    # 2. Compare new detailed grades against the old map
-    for course_name_key, course_grades in new_detailed_grades_raw.items():
-        if not isinstance(course_grades, dict): continue
-        cleaned_course_name = _clean_string(course_name_key)
-        if not cleaned_course_name: continue
-        for grade_item_details in course_grades.values(): # Iterating dict values
-            if not isinstance(grade_item_details, dict): continue
-            
-            item_key = _generate_grade_item_key(cleaned_course_name, grade_item_details)
-            if not item_key: continue # Skip if no valid item key can be generated
-
-            new_grade_value = _clean_string(grade_item_details.get("grade", ""))
-            is_meaningful_new_grade = new_grade_value and not new_grade_value.startswith("/") and new_grade_value.strip() != ""
-
-            if not is_meaningful_new_grade:
-                continue # Skip unreleased/empty grades
-
-            course_display_name, item_display_name = item_key # item_key is (cleaned_course, cleaned_item_name)
-
-            old_grade_value = old_grades_map.get(item_key)
-
-            notification_type = ""
-            description = ""
-
-            if old_grade_value is None: # Grade item is entirely new
-                notification_type = "New grade"
-                description = f"{course_display_name} - {item_display_name}: {new_grade_value}"
-            elif old_grade_value != new_grade_value: # Grade item existed, but value changed
-                notification_type = "Updated grade"
-                description = f"{course_display_name} - {item_display_name}: {new_grade_value} (was {old_grade_value})"
-            
-            if notification_type and description:
-                 # Avoid duplicate notifications within the same processing run
-                if description not in descriptions_added_this_session:
-                    logger.info(f"Attempting to add detailed grade notification for {username}: {description}")
-                    if add_notification(username, notification_type, description):
-                        notifications_added_this_run.append([notification_type, description])
-                        descriptions_added_this_session.add(description)
-                    else:
-                        logger.warning(f"Failed to add detailed grade notification for {username}: {description}")
-    
-    logger.debug(f"Finished grade comparison for {username}. Notifications added this run: {len(notifications_added_this_run)}")
-    return notifications_added_this_run
 
 
 # --- REVISED compare_attendance ---
@@ -329,7 +302,7 @@ def compare_guc_data(username, old_data, new_data):
 
     # 2. Compare Grades (detailed_grades and midterm_results) using the specialized compare_grades function
     # We pass the full old_data and new_data because compare_grades knows to extract the relevant grade parts.
-    grade_notifications = compare_grades(username, old_data, new_data)
+    grade_notifications = compare_grades(username, old_data.get("detailed_grades", {}), new_data.get("detailed_grades", {}))
     for nt in grade_notifications: # Add to current run list, compare_grades already uses add_notification
         if nt[1] not in descriptions_added_this_session: # Ensure no cross-function duplicates for this session
             notifications_added_this_run.append(nt)
