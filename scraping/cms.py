@@ -71,12 +71,17 @@ def scrape_cms_courses(username: str, password: str) -> list | None:
             cells = row.css("td")
             if len(cells) >= 6:
                 try:
-                    course_name, course_id, season_id, season_name = (
+                    course_name, course_id_raw, season_id_raw, season_name = (
                         cells[1].text(strip=True),
                         cells[4].text(strip=True),
                         cells[5].text(strip=True),
                         cells[3].text(strip=True),
                     )
+
+                    # Clean trailing ".?" from IDs, as reported in logs
+                    course_id = course_id_raw.removesuffix(".?") if course_id_raw else None
+                    season_id = season_id_raw.removesuffix(".?") if season_id_raw else None
+
                     if course_id and season_id:
                         rel_path = f"/apps/student/CourseViewStn.aspx?id={course_id}&sid={season_id}"
                         course_url = urljoin(config.BASE_CMS_URL, rel_path)
