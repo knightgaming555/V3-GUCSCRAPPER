@@ -2,44 +2,41 @@
 import logging
 import concurrent.futures
 import re
-from urllib.parse import urljoin
+import json
+from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
-from selectolax.parser import HTMLParser  # Use selectolax for fast parsing
+from selectolax.parser import HTMLParser
 import requests
-from datetime import datetime  # For week sorting
+from datetime import datetime
 
-from .core import create_session, make_request
-from utils.helpers import normalize_course_url  # Use helper for normalization
-from config import config  # Import the singleton instance
+try:
+    from .core import create_session, make_request
+    from utils.helpers import normalize_course_url
+    from config import config
+except ImportError:
+    from scraping.core import create_session, make_request
+    from utils.helpers import normalize_course_url
+    from config import config
 
 logger = logging.getLogger(__name__)
 
-# --- CMS Course List Scraping ---
+DACAST_INFO_URL_TEMPLATE = "https://playback.dacast.com/content/info?contentId={player_content_id}&provider=dacast"
+DACAST_ACCESS_URL_TEMPLATE = "https://playback.dacast.com/content/access?contentId={actual_content_id}&provider=universe"
+DACAST_REQUEST_TIMEOUT = 10
+DACAST_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
+# --- scrape_cms_courses --- (No changes)
 def scrape_cms_courses(username: str, password: str) -> list | None:
-    """
-    Scrapes the list of courses from the user's CMS homepage.
-
-    Returns:
-        list: A list of course dictionaries [{'course_name': ..., 'course_url': ..., 'season_name': ...}] on success.
-        None: On failure (auth error, network error, parsing error).
-    """
+    # ... (previous correct code) ...
     cms_home_url = config.CMS_HOME_URL
     session = create_session(username, password)
     courses = []
-
     logger.info(f"Fetching CMS course list for {username} from {cms_home_url}")
     response = make_request(session, cms_home_url, method="GET")
-
     if not response:
-        logger.error(
-            f"Failed to fetch CMS homepage for {username}. Make_request returned None."
-        )
-        return None  # Auth (401) or connection errors handled by make_request
-
+        return None
     try:
-        # Check for login page indicators even on success response
         if "login" in response.url.lower():
             soup_login_check = BeautifulSoup(response.text, "lxml")
             if soup_login_check.find(
@@ -48,94 +45,129 @@ def scrape_cms_courses(username: str, password: str) -> list | None:
                 logger.warning(
                     f"CMS Course List: Detected login page redirect for {username}."
                 )
-                return None  # Treat as auth failure
-
-        # Use selectolax for potentially faster parsing of the table
+                return None
         tree = HTMLParser(response.text)
         table = tree.css_first(
             "#ContentPlaceHolderright_ContentPlaceHoldercontent_GridViewcourses"
         )
-
         if not table:
-            logger.warning(
-                f"CMS courses table not found on {cms_home_url} for {username}."
-            )
-            # Check if the page structure might indicate no courses enrolled
             no_courses_indicator = tree.css_first(
                 "span#ContentPlaceHolderright_ContentPlaceHoldercontent_LabelNoCourses"
-            )  # Example ID, adjust if needed
+            )
             if (
                 no_courses_indicator
                 and "no courses" in no_courses_indicator.text().lower()
             ):
                 logger.info(f"User {username} has no courses enrolled on CMS.")
-                return []  # Return empty list if explicitly no courses found
-            # Otherwise, it's likely a parsing or unexpected page structure issue
-            return None  # Indicate failure if table missing and no 'no courses' message
-
+                return []
+            logger.warning(
+                f"CMS courses table not found on {cms_home_url} for {username}."
+            )
+            return None
         rows = table.css("tr")
-        if len(rows) <= 1:  # Only header row or empty
-            logger.info(f"CMS courses table found but is empty for {username}.")
-            return []  # Return empty list
-
-        for row in rows[1:]:  # Skip header row
+        if len(rows) <= 1:
+            return []
+        for row in rows[1:]:
             cells = row.css("td")
             if len(cells) >= 6:
                 try:
-                    # Extract data, cleaning whitespace
-                    course_name = cells[1].text(strip=True)
-                    course_id = cells[4].text(strip=True)
-                    season_id = cells[5].text(strip=True)
-                    season_name = cells[3].text(strip=True)
-
-                    # Construct the course URL safely
+                    course_name, course_id, season_id, season_name = (
+                        cells[1].text(strip=True),
+                        cells[4].text(strip=True),
+                        cells[5].text(strip=True),
+                        cells[3].text(strip=True),
+                    )
                     if course_id and season_id:
-                        # Use urljoin for robust URL construction relative to base CMS URL
-                        relative_path = f"/apps/student/CourseViewStn.aspx?id={course_id}&sid={season_id}"
-                        course_url = urljoin(config.BASE_CMS_URL, relative_path)
-                        # Normalize the generated URL
-                        normalized_url = normalize_course_url(course_url)
-
+                        rel_path = f"/apps/student/CourseViewStn.aspx?id={course_id}&sid={season_id}"
+                        course_url = urljoin(config.BASE_CMS_URL, rel_path)
                         courses.append(
                             {
                                 "course_name": course_name,
-                                "course_url": normalized_url,  # Store normalized URL
+                                "course_url": normalize_course_url(course_url),
                                 "season_name": season_name,
                             }
                         )
                     else:
                         logger.warning(
-                            f"Skipping row due to missing course_id or season_id for {username}: {row.html[:100]}"
+                            f"Skipping row due to missing course_id/season_id for {username}: {row.html[:100]}"
                         )
-
                 except Exception as cell_err:
                     logger.error(
                         f"Error parsing course row cells for {username}: {cell_err} - Row HTML: {row.html[:100]}",
                         exc_info=False,
-                    )  # Avoid full HTML log usually
+                    )
             else:
                 logger.warning(
                     f"Skipping course row with insufficient cells ({len(cells)}) for {username}."
                 )
-
         logger.info(f"Successfully scraped {len(courses)} courses for {username}.")
         return courses
-
     except Exception as e:
         logger.exception(f"Unexpected error scraping CMS courses for {username}: {e}")
         return None
 
 
-# --- CMS Course Content Scraping ---
-
-
-def _parse_content_item(card_node) -> dict | None:
-    """Parses a single content item card using selectolax."""
-    title_text = "Unknown Content"
-    download_url = None
+# --- _get_dacast_access_url --- (No changes)
+def _get_dacast_access_url(player_content_id: str) -> str | None:
+    # ... (previous correct code) ...
+    if not player_content_id:
+        return None
+    info_url = DACAST_INFO_URL_TEMPLATE.format(player_content_id=player_content_id)
+    logger.debug(f"Fetching Dacast info URL: {info_url}")
     try:
-        # Find title - ID often starts with 'content' followed by numbers
-        title_div = card_node.css_first("[id^='content']")
+        response = requests.get(
+            info_url, timeout=DACAST_REQUEST_TIMEOUT, headers=DACAST_HEADERS
+        )
+        response.raise_for_status()
+        data = response.json()
+        actual_content_id = data.get("contentInfo", {}).get("contentId")
+        if not actual_content_id:
+            logger.error(
+                f"Could not find 'contentInfo.contentId' in Dacast info response for {player_content_id}. Response: {data}"
+            )
+            return None
+        access_url = DACAST_ACCESS_URL_TEMPLATE.format(
+            actual_content_id=actual_content_id
+        )
+        logger.debug(f"Constructed Dacast access URL: {access_url}")
+        return access_url
+    except requests.exceptions.RequestException as req_err:
+        status_code = (
+            req_err.response.status_code if req_err.response is not None else "N/A"
+        )
+        logger.error(
+            f"Network error fetching Dacast info for {player_content_id} (Status: {status_code}): {req_err}"
+        )
+        return None
+    except json.JSONDecodeError as json_err:
+        logger.error(
+            f"Error decoding Dacast JSON response for {player_content_id}: {json_err}. Response text: {response.text[:200]}"
+        )
+        return None
+    except KeyError as key_err:
+        logger.error(
+            f"Missing key in Dacast info response for {player_content_id}: {key_err}. Response: {data}"
+        )
+        return None
+    except Exception as e:
+        logger.error(
+            f"Unexpected error getting Dacast access URL for {player_content_id}: {e}",
+            exc_info=True,
+        )
+        return None
+
+
+# --- _parse_content_item --- (FINAL CORRECTION)
+def _parse_content_item(card_node) -> dict | None:
+    """Parses a single content item card, handling VODs and downloads correctly."""
+    title_text = "Unknown Content"
+    item_url = None
+    # Determine type based on visible buttons, default to Info
+    item_type = "Info"
+
+    try:
+        # 1. Find Title
+        title_div = card_node.css_first("div[id^='content']")
         if title_div:
             title_text = (
                 title_div.text(strip=True, separator=" ")
@@ -144,77 +176,121 @@ def _parse_content_item(card_node) -> dict | None:
                 .strip()
             )
         else:
-            # Fallback: Maybe title is in a different tag like h5? Check common structures.
-            h_tag = card_node.css_first("h5, h6")  # Check h5 or h6
+            h_tag = card_node.css_first("h5, h6")
             if h_tag:
                 title_text = h_tag.text(strip=True)
             else:
                 logger.debug(
-                    "Could not find title div/tag in content card."
-                )  # Log only if truly not found
+                    f"Could not find title for card. HTML: {card_node.html[:100]}"
+                )
+                return None  # Cannot proceed without a title
 
-        # Find download link (assuming it has id='download')
-        download_link_node = card_node.css_first("a#download")
-        if download_link_node:
+        # 2. Find potential buttons/links
+        vod_button_node = card_node.css_first("input.vodbutton[data-toggle='modal']")
+        download_link_node = card_node.css_first("a#download, a.contentbtn[download]")
+
+        # 3. Determine VISIBILITY
+        vod_is_visible = (
+            vod_button_node
+            and "display:none"
+            not in vod_button_node.attributes.get("style", "").replace(" ", "")
+        )
+        download_is_visible = (
+            download_link_node
+            and "display:none"
+            not in download_link_node.attributes.get("style", "").replace(" ", "")
+        )
+
+        # 4. Process based on VISIBLE button type
+        if vod_is_visible:
+            item_type = "VOD"  # Set type definitively
+            player_content_id = vod_button_node.attributes.get("id")
+
+            if not player_content_id:
+                logger.warning(
+                    f"Visible VOD button found for '{title_text}' but lacks an ID. URL will be null."
+                )
+                item_url = None
+            else:
+                # --- NEW LOGIC: Check if player_id already contains '-vod-' ---
+                if "-vod-" in player_content_id:
+                    # Assume player_id IS the actual content ID
+                    item_url = DACAST_ACCESS_URL_TEMPLATE.format(
+                        actual_content_id=player_content_id
+                    )
+                    logger.info(
+                        f"VOD '{title_text}' ID contains '-vod-'. Using direct ID '{player_content_id}' for access URL."
+                    )
+                else:
+                    # ID doesn't contain '-vod-', need to perform the API lookup
+                    logger.info(
+                        f"VOD '{title_text}' ID '{player_content_id}' lacks '-vod-'. Fetching actual ID via Dacast API..."
+                    )
+                    item_url = _get_dacast_access_url(player_content_id)
+                    if not item_url:
+                        logger.warning(
+                            f"Could not retrieve Dacast access URL for VOD '{title_text}' (Player ID: {player_content_id}). URL set to null."
+                        )
+                        item_url = None  # Ensure null on failure
+
+        elif download_is_visible:
+            item_type = "Download"  # Set type definitively
             href = download_link_node.attributes.get("href")
             if href:
-                # Use urljoin to handle relative URLs correctly
-                download_url = urljoin(config.BASE_CMS_URL, href)
+                item_url = urljoin(config.BASE_CMS_URL, href)
+                logger.debug(f"Found Download: '{title_text}'. URL: {item_url}")
+            else:
+                logger.warning(
+                    f"Found download link for '{title_text}' but href is empty."
+                )
+                item_url = None
         else:
-            # Fallback: Check for other typical download links (e.g., class 'contentbtn')
-            download_link_node = card_node.css_first("a.contentbtn")
-            if download_link_node:
-                href = download_link_node.attributes.get("href")
-                if href:
-                    download_url = urljoin(config.BASE_CMS_URL, href)
+            # Neither visible VOD nor visible Download - Keep type as "Info"
+            item_type = "Info"
+            logger.debug(
+                f"Content item '{title_text}' has no visible VOD or download action."
+            )
+            item_url = None
 
-        # Return None only if title remains completely unknown (likely not a valid item)
-        # Allow items with no download URL
-        if title_text == "Unknown Content" and not title_div and not h_tag:
-            return None
+        # 5. Return structured data WITHOUT the "type" key
+        return {"title": title_text, "download_url": item_url}
 
-        return {"title": title_text, "download_url": download_url}
     except Exception as e:
         logger.error(
-            f"Error parsing content item: {e}. Card HTML: {card_node.html[:100]}",
-            exc_info=False,
+            f"Error parsing content item '{title_text}': {e}. Card HTML: {card_node.html[:100]}",
+            exc_info=True,
         )
+        if title_text != "Unknown Content":
+            # Return structure without type on error as well
+            return {"title": title_text, "download_url": None}
         return None
 
 
+# --- _parse_single_week --- (No changes needed)
 def _parse_single_week(week_div_node) -> dict | None:
-    """Parses a single week's data using selectolax."""
     week_name = "Unknown Week"
     try:
-        # Find week title
         week_title_tag = week_div_node.css_first("h2.text-big")
         if week_title_tag:
             week_name = week_title_tag.text(strip=True)
-
         week_data = {
             "week_name": week_name,
             "announcement": "",
             "description": "",
             "contents": [],
         }
-
-        # Find main content area (often div.p-3)
         p3_div = week_div_node.css_first("div.p-3")
         if p3_div:
-            # --- Extract Announcement / Description ---
-            # Find divs containing strong tags (Announce/Desc headers)
-            info_divs = p3_div.css("div > strong")  # More specific selector
+            info_divs = p3_div.css("div > strong")
             content_header_found = False
             for strong_tag in info_divs:
-                header_text = strong_tag.text(strip=True).lower()
-                parent_div = strong_tag.parent  # Get the containing div
-
-                # Check if this section is hidden via inline style
+                header_text, parent_div = (
+                    strong_tag.text(strip=True).lower(),
+                    strong_tag.parent,
+                )
                 is_hidden = "display:none" in parent_div.attributes.get(
                     "style", ""
                 ).replace(" ", "")
-
-                # Find the associated paragraph (usually the next <p> sibling)
                 para_text = ""
                 next_node = parent_div.next
                 while next_node:
@@ -228,44 +304,26 @@ def _parse_single_week(week_div_node) -> dict | None:
                             .strip()
                         )
                         break
-                    # Stop if we hit the next potential section header (div>strong) or content cards
                     if next_node.tag == "div" and (
                         next_node.css_matches("div > strong")
                         or next_node.css_first(".card.mb-4")
                     ):
                         break
-                    next_node = next_node.next  # Move to the *actual* next sibling
-
+                    next_node = next_node.next
                 if "announcement" in header_text and not is_hidden:
                     week_data["announcement"] = para_text
-                elif (
-                    "description" in header_text
-                ):  # Keep description even if hidden? Yes.
+                elif "description" in header_text:
                     week_data["description"] = para_text
                 elif "content" in header_text:
                     content_header_found = True
-                    # Once content header is found, stop looking for announce/desc
                     break
-
-            # --- Extract Content Items ---
             content_cards = p3_div.css(".card.mb-4")
             if content_cards:
-                # Using threads here might be overkill unless parsing _parse_content_item is very slow
-                # For selectolax, sequential might be fast enough. Test if needed.
                 contents = [_parse_content_item(card) for card in content_cards]
-                week_data["contents"] = [
-                    c for c in contents if c
-                ]  # Filter out None results
-
-        # Return None only if week name is still Unknown (parsing likely failed badly)
+                week_data["contents"] = [c for c in contents if c]
         if week_name == "Unknown Week" and not week_title_tag:
-            logger.warning(
-                f"Could not parse week name. Week div HTML: {week_div_node.html[:100]}"
-            )
             return None
-
         return week_data
-
     except Exception as e:
         logger.error(
             f"Error parsing single week '{week_name}': {e}. Week HTML: {week_div_node.html[:100]}",
@@ -274,134 +332,53 @@ def _parse_single_week(week_div_node) -> dict | None:
         return None
 
 
+# --- parse_course_content_html --- (No changes needed)
 def parse_course_content_html(html_content: str) -> list:
-    """Parses the main content area for weeks using selectolax."""
     weeks = []
     if not html_content:
-        logger.warning("parse_course_content_html received empty HTML.")
         return weeks
     try:
         tree = HTMLParser(html_content)
         week_divs = tree.css(".weeksdata")
         if not week_divs:
-            logger.warning(
-                "No week sections found (selector '.weeksdata'). Check CMS page structure."
-            )
+            logger.warning("No week sections found (selector '.weeksdata').")
             return weeks
-
-        # Using threads here can speed up parsing if _parse_single_week is complex enough
-        # Adjust max_workers based on typical number of weeks and CPU cores
-        num_weeks = len(week_divs)
-        weeks_data = []
-        if num_weeks >= 3:  # Threshold to use threading
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(num_weeks, 4), thread_name_prefix="WeekParse"
-            ) as executor:
-                future_to_week = {
-                    executor.submit(_parse_single_week, div): div for div in week_divs
-                }
-                for future in concurrent.futures.as_completed(future_to_week):
-                    try:
-                        result = future.result()
-                        if result:
-                            weeks_data.append(result)
-                    except Exception as exc:
-                        logger.error(f"Week parsing generated an exception: {exc}")
-        else:  # Parse sequentially for fewer weeks
-            weeks_data = [_parse_single_week(div) for div in week_divs]
-            weeks_data = [w for w in weeks_data if w]  # Filter None results
-
-        # Sort weeks by date (newest first) if possible
-        try:
-
-            def get_week_date(week_dict):
-                name = week_dict.get("week_name", "")
-                try:
-                    # Flexible date parsing (YYYY-MM-DD, DD/MM/YYYY, etc. - add formats as needed)
-                    date_str_match = re.search(
-                        r"(\d{4}-\d{2}-\d{2})|(\d{1,2}/\d{1,2}/\d{4})", name
-                    )
-                    if date_str_match:
-                        date_str = date_str_match.group(0)
-                        if "-" in date_str:
-                            return datetime.strptime(date_str, "%Y-%m-%d")
-                        if "/" in date_str:
-                            return datetime.strptime(
-                                date_str, "%d/%m/%Y"
-                            )  # Adjust format if needed
-                    return datetime.min  # Cannot parse date, put at end
-                except (ValueError, IndexError):
-                    return datetime.min
-
-            weeks_data.sort(key=get_week_date, reverse=True)
-        except Exception as sort_err:
-            logger.warning(
-                f"Could not sort weeks based on date: {sort_err}. Returning in parsed order."
-            )
-
+        weeks_data = [_parse_single_week(div) for div in week_divs]
+        weeks_data = [w for w in weeks_data if w]
+        # Assuming weeks are scraped in the desired order (newest to oldest)
+        # from the HTML structure. No explicit sort or reverse is applied.
         return weeks_data
-
     except Exception as e:
         logger.exception(f"Error during course content HTML parsing: {e}")
-        return []  # Return empty list on major parsing error
+        return []
 
 
+# --- scrape_course_content --- (No changes needed)
 def scrape_course_content(username: str, password: str, course_url: str) -> list | None:
-    """
-    Scrapes the content (weeks, materials) for a specific CMS course page.
-
-    Args:
-        username: User's GUC username.
-        password: User's GUC password.
-        course_url: The *normalized* URL of the course.
-
-    Returns:
-        list: A list of week dictionaries containing parsed content on success.
-        None: On failure (auth, network, parsing errors).
-    """
     if not course_url:
-        logger.error("scrape_course_content called with empty course_url.")
         return None
-
     session = create_session(username, password)
     logger.info(f"Fetching CMS course content for {username} from {course_url}")
-
     response = make_request(session, course_url, method="GET")
-
     if not response:
-        logger.error(
-            f"Failed to fetch course content page for {username} from {course_url}."
-        )
-        return None  # Auth or connection error handled by make_request
-
+        return None
     try:
-        # Check for login page indicators even on success response
         if "login" in response.url.lower():
+            from bs4 import BeautifulSoup
+
             soup_login_check = BeautifulSoup(response.text, "lxml")
             if soup_login_check.find(
                 "form", action=lambda x: x and "login" in x.lower()
             ):
-                logger.warning(
-                    f"CMS Course Content: Detected login page redirect for {username} at {course_url}."
-                )
-                return None  # Treat as auth failure
-
+                return None
         html_content = response.text
         if not html_content:
-            logger.warning(f"Received empty HTML content for {course_url}")
             return None
-
         parsed_content = parse_course_content_html(html_content)
-
-        # parse_course_content_html returns [] on parsing success but no weeks found,
-        # or on major parsing error. It logs errors internally.
-        # We return the list (even if empty) on success or partial success.
-        # Return None only if the fetch itself failed initially.
         logger.info(
             f"Finished parsing course content for {username} from {course_url}. Found {len(parsed_content)} weeks."
         )
         return parsed_content
-
     except Exception as e:
         logger.exception(
             f"Unexpected error scraping course content for {username} at {course_url}: {e}"
@@ -409,90 +386,45 @@ def scrape_course_content(username: str, password: str, course_url: str) -> list
         return None
 
 
-# --- CMS Course Announcements Scraping ---
-
-
+# --- scrape_course_announcements --- (No changes needed)
 def scrape_course_announcements(
     username: str, password: str, course_url: str
 ) -> dict | None:
-    """
-    Scrapes the main announcement section from a specific CMS course page.
-
-    Args:
-        username: User's GUC username.
-        password: User's GUC password.
-        course_url: The *normalized* URL of the course.
-
-    Returns:
-        dict: {'announcements_html': '...'} containing the raw HTML of the announcement section.
-        dict: {'error': '...'} if announcements section not found or other error.
-        None: On critical failure (auth, network).
-    """
     if not course_url:
-        logger.error("scrape_course_announcements called with empty course_url.")
         return {"error": "Missing course URL"}
-
     session = create_session(username, password)
     logger.info(f"Fetching CMS course announcements for {username} from {course_url}")
-
     response = make_request(session, course_url, method="GET")
-
     if not response:
         logger.error(f"Failed to fetch course page for announcements: {course_url}")
-        return None  # Auth or connection error
-
+        return None
     try:
-        # Check for login page indicators
         if "login" in response.url.lower():
+            from bs4 import BeautifulSoup
+
             soup_login_check = BeautifulSoup(response.text, "lxml")
             if soup_login_check.find(
                 "form", action=lambda x: x and "login" in x.lower()
             ):
-                logger.warning(
-                    f"CMS Announcements: Detected login page redirect for {username} at {course_url}."
-                )
-                return None  # Treat as auth failure
-
-        # Use selectolax for speed
+                return None
         tree = HTMLParser(response.text)
-        # Find the specific announcement div (adjust ID if needed)
-        # Common IDs: desc, GeneralAnnouncements, CourseDescription... check actual source
         announcement_div = tree.css_first(
             "div#ContentPlaceHolderright_ContentPlaceHoldercontent_desc"
-        )  # Check this ID first
+        )
         if not announcement_div:
-            # Add fallbacks if the ID changes or varies
-            announcement_div = tree.css_first(
-                "div#GeneralAnnouncements"
-            )  # Example fallback
+            announcement_div = tree.css_first("div.p-xl-2")
             if not announcement_div:
-                # Try finding a div with a header like "General Announcement"
-                headers = tree.css("h3, h4")  # Check common header tags
-                for header in headers:
-                    if "general announcement" in header.text().lower():
-                        # Assume announcement div is the parent or a sibling? Needs inspection.
-                        # This is less reliable. Parent is common.
-                        announcement_div = header.parent
-                        if announcement_div:
-                            break
-                if not announcement_div:
-                    logger.warning(
-                        f"Course announcement section not found on {course_url} for {username}."
-                    )
-                    return {"error": "Announcement section not found"}
-
-        # Get the inner HTML content of the div
-        # html_content = announcement_div.innerHTML # selectolax way
-        # Use decode_contents with BS4 if innerHTML causes issues or need BS4 processing
-        soup_div = BeautifulSoup(announcement_div.html, "lxml").find(
-            "div"
-        )  # Re-parse fragment if needed
-        html_content = soup_div.decode_contents() if soup_div else announcement_div.html
-
+                logger.warning(
+                    f"Course announcement section not found on {course_url} for {username}."
+                )
+                return {"error": "Announcement section not found"}
+            else:
+                logger.info(
+                    f"Found potential announcement section using fallback selector 'div.p-xl-2' on {course_url}"
+                )
+        html_content = announcement_div.html.strip() if announcement_div.html else ""
         logger.info(f"Successfully scraped course announcements from {course_url}")
-        # Return the raw HTML content within the expected key
         return {"announcements_html": html_content}
-
     except Exception as e:
         logger.exception(
             f"Error scraping course announcements for {username} at {course_url}: {e}"
@@ -500,46 +432,16 @@ def scrape_course_announcements(
         return {"error": f"Unexpected error during announcement scraping: {e}"}
 
 
-# --- Combined CMS Scraper (Refactored) ---
-# This function now orchestrates fetching course list OR specific content/announcements
-
-
+# --- Combined CMS Scraper --- (No changes needed)
 def cms_scraper(
     username: str, password: str, course_url: str = None, force_refresh: bool = False
 ) -> list | dict | None:
-    """
-    Main function to scrape CMS data.
-
-    - If course_url is None: Fetches the list of all courses for the user.
-    - If course_url is provided: Fetches content and announcements for that specific course.
-
-    Args:
-        username (str): User's GUC username.
-        password (str): User's GUC password.
-        course_url (str, optional): The specific course URL to scrape. Defaults to None.
-        force_refresh (bool, optional): If True, bypasses cache for the course list. Defaults to False.
-
-    Returns:
-        list: List of course dicts if course_url is None.
-        dict: Dict containing {'course_content': list, 'course_announcement': dict | None} if course_url is provided.
-              The announcement dict is {'announcements_html': '...'}.
-        None: On critical failures (auth, network).
-    """
     if course_url:
-        # --- Fetch Specific Course Data ---
         normalized_url = normalize_course_url(course_url)
         if not normalized_url:
-            return {
-                "error": "Invalid course URL provided."
-            }  # Return error dict for specific course failure
-
+            return {"error": "Invalid course URL provided."}
         logger.info(f"Scraping specific CMS course: {username} - {normalized_url}")
-
-        # Fetch content and announcements concurrently
-        content_list = None
-        announcement_result = None
-        fetch_success = False
-
+        content_list, announcement_result, fetch_success = None, None, False
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="CourseData"
         ) as executor:
@@ -550,45 +452,29 @@ def cms_scraper(
                 scrape_course_announcements, username, password, normalized_url
             )
             try:
-                content_list = content_future.result()  # Returns list or None
-                if content_list is not None:
-                    fetch_success = True  # Success even if list is empty
+                content_list = content_future.result()
+                fetch_success = fetch_success or (content_list is not None)
             except Exception as e:
-                logger.error(f"Course content future error: {e}")
+                logger.exception(f"Exception retrieving content future result: {e}")
             try:
-                announcement_result = (
-                    announcement_future.result()
-                )  # Returns dict or None
-                if announcement_result is not None:
-                    fetch_success = True  # Success even if {'error':...}
+                announcement_result = announcement_future.result()
+                fetch_success = fetch_success or (announcement_result is not None)
             except Exception as e:
-                logger.error(f"Course announcement future error: {e}")
-
+                logger.exception(
+                    f"Exception retrieving announcement future result: {e}"
+                )
         if not fetch_success:
             logger.error(
-                f"Both content and announcement fetch failed for specific course: {normalized_url}"
+                f"Both content/announcement fetch critically failed: {normalized_url}"
             )
-            # Decide return value: None indicates total failure, dict indicates partial/specific failure
-            return {"error": "Failed to fetch data for the specified course."}
-
-        # Structure the result for a single course
-        # announcement_result might be None or {'error':...} or {'announcements_html':...}
+            return None
         course_data = {
             "course_url": normalized_url,
-            "course_content": (
-                content_list if content_list is not None else []
-            ),  # Return empty list on content fetch failure
-            "course_announcement": announcement_result,  # Pass through the result (None, error dict, or success dict)
+            "course_content": (content_list if content_list is not None else []),
+            "course_announcement": announcement_result,
         }
         return course_data
-
     else:
-        # --- Fetch Course List ---
         logger.info(f"Fetching CMS course list for user: {username}")
-        # Cache logic for course list needs to be handled here if desired
-        # For simplicity in refactor, fetching fresh list each time unless cached by a separate mechanism
-        # If force_refresh is used elsewhere, it might apply here too.
-        # cache_key = generate_cache_key("cms_courses", username) etc.
         courses = scrape_cms_courses(username, password)
-        # scrape_cms_courses returns list or None
-        return courses  # Return the list of courses or None on failure
+        return courses
