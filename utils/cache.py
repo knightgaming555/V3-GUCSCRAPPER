@@ -208,3 +208,26 @@ def get_pickle_cache(key: str):
     except Exception as e:
         logger.error(f"[Cache] Error getting key (pickle) '{key}': {e}", exc_info=True)
     return None
+
+
+def set_pickle_cache(key: str, value, timeout: int = config.CACHE_DEFAULT_TIMEOUT):
+    """Pickles the value and stores it in Redis cache with expiry."""
+    if not redis_client:
+        logger.warning("Redis client not available, cannot set pickle cache.")
+        return False
+    try:
+        pickled_value = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        # redis_client is initialized with decode_responses=False, so it expects bytes for key and value with setex
+        redis_client.setex(key.encode("utf-8"), timeout, pickled_value)
+        logger.info(f"Set PICKLE cache for key {key} with expiry {timeout} seconds")
+        return True
+    except redis.exceptions.ConnectionError as e:
+        logger.error(f"Pickle Cache: Redis connection error on set '{key}': {e}")
+    except (pickle.PicklingError, TypeError) as e: # Catch errors during pickling
+        logger.error(
+            f"Pickle Cache: Error pickling value for key '{key}': {e}",
+            exc_info=True,
+        )
+    except Exception as e:
+        logger.error(f"Pickle Cache: Error setting key {key}: {e}", exc_info=True)
+    return False
