@@ -7,12 +7,16 @@ import hashlib  # Added for hash generation
 
 from config import config
 from scraping.core import create_session, make_request
-from utils.auth import validate_credentials_flow, AuthError
+from utils.auth import (
+    AuthError, 
+    get_password_for_readonly_session
+)
 from utils.cache import (
     get_from_cache, 
     set_in_cache, 
     generate_cache_key, 
-    get_pickle_cache
+    get_pickle_cache,
+    set_pickle_cache
 )
 from utils.helpers import normalize_course_url
 
@@ -63,6 +67,16 @@ def get_combined_course_data(
     key_string_for_hash = f"{username}:{normalized_url}"
     hash_value = hashlib.md5(key_string_for_hash.encode("utf-8")).hexdigest()
     cache_key = f"{CMS_COURSE_DATA_CACHE_PREFIX}:{hash_value}"
+
+    # NEW global cache key generation (matching refresh_cache.py's modified generate_cms_content_cache_key logic):
+    if not normalized_url:
+        # This case should ideally be caught before, but as a safeguard:
+        logger.error(f"Cannot generate cache key from invalid normalized_url: {course_url}")
+        return {"error": "Invalid course URL for cache key generation."}
+    
+    global_hash_value = hashlib.md5(normalized_url.encode("utf-8")).hexdigest()
+    cache_key = f"{CMS_COURSE_DATA_CACHE_PREFIX}:{global_hash_value}"
+    logger.debug(f"Using global cache key for {normalized_url}: {cache_key}")
 
     # 1. Check Cache (only if force_refresh is False)
     if not force_refresh:
@@ -161,10 +175,10 @@ def get_combined_course_data(
     if course_announcement_dict_to_add or (
         content_list is not None and isinstance(content_list, list)
     ):
-        set_in_cache(
-            cache_key, combined_data_for_cache, timeout=config.CACHE_DEFAULT_TIMEOUT
+        set_pickle_cache(
+            cache_key, combined_data_for_cache, timeout=config.CACHE_LONG_CMS_CONTENT_TIMEOUT
         )
-        logger.info(f"Cached fresh combined CMS data for {cache_key}")
+        logger.info(f"Cached fresh combined CMS data (pickled) for {cache_key}")
     else:
         logger.warning(f"Skipping cache set for {cache_key} - only Mock Week resulted.")
 
@@ -178,35 +192,36 @@ def get_combined_course_data(
 @cms_bp.route("/cms_data", methods=["GET"])
 def api_cms_courses():
     """Endpoint to fetch the list of courses from CMS homepage."""
-    # --- Bot Health Check ---
     if request.args.get("bot", "").lower() == "true":
         logger.info("Received bot health check request for CMS Courses API.")
         g.log_outcome = "bot_check_success"
-        return (
-            jsonify(
-                {
-                    "status": "Success",
-                    "message": "CMS Courses API route is up!",
-                    "data": None,
-                }
-            ),
-            200,
-        )
+        return jsonify({
+            "status": "Success",
+            "message": "CMS Courses API route is up!",
+            "data": None,
+        }), 200
 
     username = request.args.get("username")
     password = request.args.get("password")
     force_refresh = request.args.get("force_refresh", "false").lower() == "true"
     g.username = username
+
     if username == "google.user" and password == "google@3569":
-        logger.info(f"Serving mock cms data data for user {username}")
+        logger.info(f"Serving mock cms data for user {username}")
         g.log_outcome = "mock_data_served"
-        # Use the imported mock data and jsonify it
         return jsonify(cmsdata_mockData), 200
 
     try:
-        password_to_use = validate_credentials_flow(username, password)
+        if not username or not password:
+            g.log_outcome = "validation_error_cms_courses"
+            g.log_error_message = "Missing required parameters (username, password) for CMS Courses"
+            return jsonify({
+                "status": "error",
+                "message": "Missing required parameters: username, password"
+            }), 400
 
-        # --- Cache Check ---
+        password_to_use = get_password_for_readonly_session(username, password)
+
         cache_key = generate_cache_key(CMS_COURSES_CACHE_PREFIX, username)
         if not force_refresh:
             cached_data = get_from_cache(cache_key)
@@ -273,25 +288,18 @@ def api_cms_content():
     Accepts 'force_refresh=true' to bypass cache.
     Returns the combined list structure: [AnnouncementDict?, MockWeekDict, WeekDict1...]
     """
-    # --- Bot Health Check ---
     if request.args.get("bot", "").lower() == "true":
         logger.info("Received bot health check request for CMS Content API.")
         g.log_outcome = "bot_check_success"
-        return (
-            jsonify(
-                {
-                    "status": "Success",
-                    "message": "CMS Content API route is up!",
-                    "data": None,
-                }
-            ),
-            200,
-        )
+        return jsonify({
+            "status": "Success",
+            "message": "CMS Content API route is up!",
+            "data": None,
+        }), 200
 
     username = request.args.get("username")
     password = request.args.get("password")
     course_url = request.args.get("course_url")
-    # --- Add force_refresh parameter ---
     force_refresh = request.args.get("force_refresh", "false").lower() == "true"
     g.username = username
 
@@ -299,133 +307,82 @@ def api_cms_content():
         logger.info(f"Handling mock cms content request for user {username}")
 
         if not course_url:
-            # Handle missing course_url for mock user too
             logger.warning("Mock user request missing course_url")
             g.log_outcome = "mock_validation_error"
             g.log_error_message = "Missing course_url parameter for mock user"
-            return (
-                jsonify(
-                    {
-                        "status": "error",
-                        "message": "Missing required parameter: course_url",
-                    }
-                ),
-                400,
-            )
+            return jsonify({
+                "status": "error",
+                "message": "Missing required parameter: course_url",
+            }), 400
 
-        # Normalize the requested URL using the *actual* function used elsewhere
         normalized_requested_url = normalize_course_url(course_url)
         if not normalized_requested_url:
             logger.warning(f"Mock user request invalid course_url: {course_url}")
             g.log_outcome = "mock_validation_error"
-            g.log_error_message = (
-                f"Invalid course_url format for mock user: {course_url}"
-            )
-            return (
-                jsonify({"status": "error", "message": "Invalid course_url format"}),
-                400,
-            )
+            g.log_error_message = f"Invalid course_url format for mock user: {course_url}"
+            return jsonify({"status": "error", "message": "Invalid course_url format"}), 400
 
-        # --- Use the map to find the content ---
         specific_mock_content = mock_content_map.get(normalized_requested_url)
-
         if specific_mock_content is not None:
-            logger.info(
-                f"Serving specific mock content for matching course URL: {course_url}"
-            )
+            logger.info(f"Serving specific mock content for matching course URL: {course_url}")
             g.log_outcome = "mock_data_served_specific"
-            # Use the mapped mock data and jsonify it
             return jsonify(specific_mock_content), 200
         else:
-            logger.info(
-                f"No specific mock content defined for course URL: {course_url}. Returning empty list for mock user."
-            )
+            logger.info(f"No specific mock content for course URL: {course_url}. Returning empty list.")
             g.log_outcome = "mock_data_served_empty"
-            # Return an empty list as no specific mock data exists for this URL in the map
             return jsonify([]), 200
 
     if not course_url:
-        g.log_outcome = "validation_error"
+        g.log_outcome = "validation_error_cms_content"
         g.log_error_message = "Missing course_url parameter"
+        return jsonify({
+            "status": "error", "message": "Missing required parameter: course_url"
+        }), 400
+        
+    password_to_use = get_password_for_readonly_session(username, password)
+
+    result_data = get_combined_course_data(
+        username, password_to_use, course_url, force_refresh=force_refresh
+    )
+
+    # --- Process the result ---
+    if isinstance(result_data, dict) and "error" in result_data:
+        error_msg = result_data["error"]
+        logger.error(
+            f"Failed to get combined CMS data for {username} - {course_url}: {error_msg}"
+        )
+        g.log_outcome = "scrape_error"
+        g.log_error_message = error_msg
+        status_code = 500
+        if "Authentication" in error_msg:
+            status_code = 401
+        elif "fetch" in error_msg:
+            status_code = 504
+        elif "parse" in error_msg:
+            status_code = 502
+        elif "not found" in error_msg:
+            status_code = 404
+        return jsonify({"status": "error", "message": error_msg}), status_code
+    elif isinstance(result_data, list):
+        g.log_outcome = (
+            "success_force_refresh" if force_refresh else "success"
+        )  # Differentiate log outcome
+        logger.info(
+            f"Successfully served combined CMS data for {username} - {course_url}{' (forced refresh)' if force_refresh else ''}"
+        )
+        return jsonify(result_data), 200
+    else:
+        logger.error(
+            f"Unexpected return type from get_combined_course_data: {type(result_data)}"
+        )
+        g.log_outcome = "internal_error_logic"
+        g.log_error_message = "Unexpected data format from CMS helper"
         return (
             jsonify(
-                {"status": "error", "message": "Missing required parameter: course_url"}
-            ),
-            400,
-        )
-
-    normalized_url = normalize_course_url(course_url)
-    if not normalized_url:
-        g.log_outcome = "validation_error"
-        g.log_error_message = f"Invalid course_url format: {course_url}"
-        return jsonify({"status": "error", "message": "Invalid course_url format"}), 400
-
-    try:
-        password_to_use = validate_credentials_flow(username, password)
-
-        # --- Call the helper with force_refresh ---
-        result_data = get_combined_course_data(
-            username, password_to_use, normalized_url, force_refresh=force_refresh
-        )
-
-        # --- Process the result ---
-        if isinstance(result_data, dict) and "error" in result_data:
-            error_msg = result_data["error"]
-            logger.error(
-                f"Failed to get combined CMS data for {username} - {normalized_url}: {error_msg}"
-            )
-            g.log_outcome = "scrape_error"
-            g.log_error_message = error_msg
-            status_code = 500
-            if "Authentication" in error_msg:
-                status_code = 401
-            elif "fetch" in error_msg:
-                status_code = 504
-            elif "parse" in error_msg:
-                status_code = 502
-            elif "not found" in error_msg:
-                status_code = 404
-            return jsonify({"status": "error", "message": error_msg}), status_code
-        elif isinstance(result_data, list):
-            g.log_outcome = (
-                "success_force_refresh" if force_refresh else "success"
-            )  # Differentiate log outcome
-            logger.info(
-                f"Successfully served combined CMS data for {username} - {normalized_url}{' (forced refresh)' if force_refresh else ''}"
-            )
-            return jsonify(result_data), 200
-        else:
-            logger.error(
-                f"Unexpected return type from get_combined_course_data: {type(result_data)}"
-            )
-            g.log_outcome = "internal_error_logic"
-            g.log_error_message = "Unexpected data format from CMS helper"
-            return (
-                jsonify(
-                    {
-                        "status": "error",
-                        "message": "Internal server error processing CMS data",
-                    }
-                ),
-                500,
-            )
-
-    except AuthError as e:
-        logger.warning(
-            f"AuthError during CMS content request for {username}: {e.log_message}"
-        )
-        g.log_outcome = e.log_outcome
-        g.log_error_message = e.log_message
-        return jsonify({"status": "error", "message": str(e)}), e.status_code
-    except Exception as e:
-        logger.exception(
-            f"Unhandled exception during /api/cms_content for {username}: {e}"
-        )
-        g.log_outcome = "internal_error_unhandled"
-        g.log_error_message = f"Unhandled exception: {e}"
-        return (
-            jsonify(
-                {"status": "error", "message": "An internal server error occurred"}
+                {
+                    "status": "error",
+                    "message": "Internal server error processing CMS data",
+                }
             ),
             500,
         )
@@ -435,34 +392,39 @@ def api_cms_content():
 @cms_bp.route("/cms_notifications", methods=["GET"])
 def api_cms_notifications():
     """Endpoint to fetch notifications from the CMS homepage."""
-    # --- Bot Health Check ---
     if request.args.get("bot", "").lower() == "true":
         logger.info("Received bot health check request for CMS Notifications API.")
         g.log_outcome = "bot_check_success"
-        return (
-            jsonify(
-                {
-                    "status": "Success",
-                    "message": "CMS Notifications API route is up!",
-                    "data": None,
-                }
-            ),
-            200,
-        )
+        return jsonify({
+            "status": "Success",
+            "message": "CMS Notifications API route is up!",
+            "data": None,
+        }), 200
 
     username = request.args.get("username")
     password = request.args.get("password")
+    force_refresh = request.args.get("force_refresh", "false").lower() == "true"
     g.username = username
-    force_refresh = (
-        request.args.get("force_refresh", "false").lower() == "true"
-    )  # Added force_refresh
+
+    # Add mock user check if needed, for consistency, though not present before
+    if username == "google.user" and password == "google@3569":
+        logger.info(f"Serving mock CMS notifications for user {username}")
+        g.log_outcome = "mock_data_served"
+        return jsonify([]), 200 # Assuming mock notifications are an empty list or fetch from mock_data
 
     try:
-        password_to_use = validate_credentials_flow(username, password)
+        if not username or not password:
+            g.log_outcome = "validation_error_cms_notifications"
+            g.log_error_message = "Missing required parameters (username, password) for CMS Notifications"
+            return jsonify({
+                "status": "error",
+                "message": "Missing required parameters: username, password"
+            }), 400
 
-        # --- Cache Check ---
+        password_to_use = get_password_for_readonly_session(username, password)
+
         cache_key = generate_cache_key(CMS_NOTIFICATIONS_CACHE_PREFIX, username)
-        if not force_refresh:  # Check flag
+        if not force_refresh:
             cached_data = get_from_cache(cache_key)
             if cached_data is not None:
                 logger.info(f"Serving CMS notifications from cache for {username}")
@@ -536,52 +498,53 @@ def api_cms_notifications():
 @cms_bp.route("/announcements", methods=["GET"])
 def api_announcements():
     """Fetches announcements for a specific course URL."""
-    # --- Bot Health Check ---
     if request.args.get("bot", "").lower() == "true":
         logger.info("Received bot health check request for Announcements API.")
         g.log_outcome = "bot_check_success"
-        return (
-            jsonify(
-                {
-                    "status": "Success",
-                    "message": "Announcements API route is up!",
-                    "data": None,
-                }
-            ),
-            200,
-        )
+        return jsonify({
+            "status": "Success",
+            "message": "Announcements API route is up!",
+            "data": None,
+        }), 200
 
     username = request.args.get("username")
     password = request.args.get("password")
     course_url = request.args.get("course_url")
+    force_refresh = request.args.get("force_refresh", "false").lower() == "true"
     g.username = username
 
+    # Add mock user check if needed
+    if username == "google.user" and password == "google@3569":
+        logger.info(f"Serving mock announcements for user {username}, course {course_url}")
+        g.log_outcome = "mock_data_served"
+        # Assuming mock announcements might be course-specific or a generic empty response
+        return jsonify({"announcements_html": ""}), 200
+
     if not course_url:
-        g.log_outcome = "validation_error"
+        g.log_outcome = "validation_error_announcements"
         g.log_error_message = "Missing course_url parameter"
-        return (
-            jsonify(
-                {"status": "error", "message": "Missing required parameter: course_url"}
-            ),
-            400,
-        )
+        return jsonify({
+            "status": "error", "message": "Missing required parameter: course_url"
+        }), 400
+        
+    if not username or not password: # Add full param check
+        g.log_outcome = "validation_error_announcements"
+        g.log_error_message = "Missing required parameters (username, password)"
+        return jsonify({
+            "status": "error",
+            "message": "Missing required parameters: username, password"
+        }), 400
 
     normalized_url = normalize_course_url(course_url)
     if not normalized_url:
-        g.log_outcome = "validation_error"
+        g.log_outcome = "validation_error_announcements"
         g.log_error_message = f"Invalid course_url format: {course_url}"
         return jsonify({"status": "error", "message": "Invalid course_url format"}), 400
 
     try:
-        password_to_use = validate_credentials_flow(username, password)
+        password_to_use = get_password_for_readonly_session(username, password)
 
-        # NOTE: Consider if this specific endpoint also needs force_refresh.
-        # For now, it doesn't have cache logic, so force_refresh is irrelevant here.
-        # If caching were added, force_refresh would be needed here too.
-
-        logger.info(
-            f"Fetching announcements for specific course: {username} - {normalized_url}"
-        )
+        logger.info(f"Fetching announcements for specific course: {username} - {normalized_url}")
         g.log_outcome = "scrape_attempt"
 
         announcement_result = scrape_course_announcements(
