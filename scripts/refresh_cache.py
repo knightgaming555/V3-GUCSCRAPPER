@@ -27,7 +27,9 @@ try:
     from utils.cache import set_in_cache as set_json_cache  # Alias for clarity
     from utils.cache import get_from_cache  # For getting old data
     from utils.cache import generate_cache_key
-    from utils.cache import redis_client  # Need raw client for pickle
+    # Import pickle cache functions from utils.cache
+    from utils.cache import get_pickle_cache, set_pickle_cache 
+    # from utils.cache import redis_client # No longer need raw client here directly if set_pickle_cache in utils handles it
     from utils.helpers import normalize_course_url  # For CMS content key
 
     # Import the comparison functions
@@ -67,43 +69,66 @@ logging.basicConfig(
 )
 logger = logging.getLogger("refresh_cache_script")
 logging.getLogger("urllib3").setLevel(logging.WARNING)  # Quieten noisy libraries
+logging.getLogger("utils.notifications_utils").setLevel(logging.DEBUG) # Ensure debug logs from this module are shown
 
 
 # --- Pickle Caching for CMS Content (Matches refresh_cms_content-2.py) ---
 # Use separate functions for pickle cache to avoid conflicts with JSON cache client settings
-def set_pickle_cache(key: str, value, timeout: int = config.CACHE_DEFAULT_TIMEOUT):
-    raw_redis_client = None
-    try:
-        # Use from_url to correctly parse REDIS_URL
-        raw_redis_client = redis.Redis.from_url(
-            config.REDIS_URL, 
-            db=config.REDIS_DB if hasattr(config, 'REDIS_DB') else 0, # from_url might handle db in URL, but explicit is safer if REDIS_DB is ever defined separately
-            decode_responses=False # Important: Do not decode for pickle
-        )
-        pickled_value = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
-        raw_redis_client.setex(key.encode("utf-8"), timeout, pickled_value)
-        logger.info(f"Set PICKLE cache for key {key} with expiry {timeout} seconds")
-        return True
-    except redis.exceptions.ConnectionError as e:
-        logger.error(f"Pickle Cache: Redis connection error on set '{key}': {e}")
-    except Exception as e:
-        logger.error(f"Pickle Cache: Error setting key {key}: {e}", exc_info=True)
-    finally:
-        # Ensure connection is closed if it was opened here
-        try:
-            raw_redis_client.close()
-        except Exception:
-            pass  # Ignore errors during close
-    return False
+# def set_pickle_cache(key: str, value, timeout: int = config.CACHE_DEFAULT_TIMEOUT):
+#     raw_redis_client = None
+#     try:
+#         # Use from_url to correctly parse REDIS_URL
+#         raw_redis_client = redis.Redis.from_url(
+#             config.REDIS_URL, 
+#             db=config.REDIS_DB if hasattr(config, 'REDIS_DB') else 0, # from_url might handle db in URL, but explicit is safer if REDIS_DB is ever defined separately
+#             decode_responses=False # Important: Do not decode for pickle
+#         )
+#         pickled_value = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+#         raw_redis_client.setex(key.encode("utf-8"), timeout, pickled_value)
+#         logger.info(f"Set PICKLE cache for key {key} with expiry {timeout} seconds")
+#         return True
+#     except redis.exceptions.ConnectionError as e:
+#         logger.error(f"Pickle Cache: Redis connection error on set '{key}': {e}")
+#     except Exception as e:
+#         logger.error(f"Pickle Cache: Error setting key {key}: {e}", exc_info=True)
+#     finally:
+#         # Ensure connection is closed if it was opened here
+#         # Check if raw_redis_client was initialized before trying to close
+#         if raw_redis_client:
+#             try:
+#                 raw_redis_client.close()
+#             except Exception:
+#                 pass  # Ignore errors during close
+#     return False
 
 
-def generate_cms_content_cache_key(username: str, course_url: str) -> str:
-    """Generates the specific cache key used by cms_content (hash based)."""
+# def generate_cms_content_cache_key(course_url: str) -> str: # Keep this local as it's specific to cms_content structure
+#     """Generates a global cache key for cms_content based on the course URL."""
+#     normalized_url = normalize_course_url(course_url)
+#     if not normalized_url:
+#         return None
+#     # Key no longer includes username, only the normalized URL's hash.
+#     hash_value = hashlib.md5(normalized_url.encode("utf-8")).hexdigest()
+#     return f"cms_content:{hash_value}"
+
+# Keep generate_cms_content_cache_key local or move to utils if it becomes more general.
+# For now, it seems specific enough to stay if it encapsulates the "cms_content:{hash}" structure.
+# Let's assume it should stay local for now to minimize changes not directly requested.
+# The request was about set_pickle_cache consistency.
+
+# The `generate_cms_content_cache_key` uses `normalize_course_url` and `hashlib.md5`
+# and prepends "cms_content:". This logic is specific to how CMS content keys are formed.
+# It's not a general cache key generation utility. So, it makes sense to keep it here
+# or move it to a more specific cms_utils.py if that existed.
+# The `utils.cache.generate_cache_key` is a more general username-based key generator.
+
+# Retaining the local `generate_cms_content_cache_key` function:
+def generate_cms_content_cache_key(course_url: str) -> str:
+    """Generates a global cache key for cms_content based on the course URL."""
     normalized_url = normalize_course_url(course_url)
-    if not normalized_url:  # Handle normalization failure
+    if not normalized_url:
         return None
-    key_string = f"{username}:{normalized_url}"
-    hash_value = hashlib.md5(key_string.encode("utf-8")).hexdigest()
+    hash_value = hashlib.md5(normalized_url.encode("utf-8")).hexdigest()
     return f"cms_content:{hash_value}"
 
 
@@ -162,7 +187,7 @@ REFRESH_CONFIG = {
         "func": None,  # Wrapper handles this
         "args": [],
         "cache_prefix": "cms_content",  # Prefix used for key generation
-        "timeout": config.CACHE_LONG_CMS_CONTENT_TIMEOUT,
+        "timeout": 3600, # 1 hour timeout as requested
         "cache_func": set_pickle_cache,
         "compare_func": None,  # Comparison handled differently or not implemented
     },
@@ -170,6 +195,7 @@ REFRESH_CONFIG = {
 
 TARGET_NOTIFICATION_USERS = ["mohamed.elsaadi", "seif.elkady"] # Added for specific user notifications
 MAX_NOTIFICATIONS_LIMIT = 5 # Max notifications to keep per user
+RETRY_DELAY_SECONDS = 5 # Delay between retries for CMS content fetching
 
 SECTION_MAP = {
     "1": ["guc_data", "schedule"],
@@ -180,83 +206,102 @@ SECTION_MAP = {
 
 
 # --- Wrapper for Single Course Content Refresh ---
-async def _refresh_single_cms_course(username, password, course_entry):
-    """Fetches, assembles, and caches data for ONE cms course using pickle."""
+async def _refresh_single_cms_course(username_for_creds, password_for_creds, course_entry):
+    """
+    Fetches, assembles, and caches data for ONE cms course using pickle.
+    Implements retry logic. Does NOT check if already refreshed this run (caller handles that).
+    """
     course_url = course_entry.get("course_url")
     course_name = course_entry.get("course_name", "Unknown")
+
     if not course_url:
         logger.error(
-            f"Missing course_url in course entry for {username}: {course_entry}"
+            f"Missing course_url in course entry for {username_for_creds} (used for creds): {course_entry}"
         )
         return {"status": "skipped", "reason": "missing url"}
 
     normalized_url = normalize_course_url(course_url)
     if not normalized_url:
         logger.error(
-            f"URL normalization failed for {username} - {course_name}: {course_url}"
+            f"URL normalization failed for {username_for_creds} (used for creds) - {course_name}: {course_url}"
         )
         return {"status": "skipped", "reason": "normalization failed"}
 
-    # Use the specific hash-based key generator for cms_content
-    cache_key = generate_cms_content_cache_key(username, normalized_url)
-    if (
-        not cache_key
-    ):  # Handle key generation failure (e.g., from normalization failure)
-        logger.error(f"Could not generate cache key for {username} - {course_name}")
-        return {"status": "failed", "reason": "key generation error"}
+    # Use the global hash-based key generator for cms_content
+    cache_key = generate_cms_content_cache_key(normalized_url) # Pass normalized_url
+    if not cache_key:
+        logger.error(f"Could not generate GLOBAL cache key for {course_name} (URL: {normalized_url})")
+        return {"status": "failed", "reason": "global key generation error"}
 
     logger.debug(
-        f"Refreshing CMS content for {username} - {course_name} ({normalized_url})"
+        f"Refreshing CMS content for course {course_name} ({normalized_url}) using creds of {username_for_creds}"
     )
 
     content_list = None
     announcement_result = None
     fetch_success = False
     loop = asyncio.get_running_loop()
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        logger.info(f"Attempt {attempt + 1}/{max_retries} to fetch CMS content for {course_name} ({normalized_url})")
+        current_attempt_fetch_success = False
+        # Run content and announcement fetching concurrently using threads
+        max_workers_cms = min(4, os.cpu_count() or 1)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers_cms, thread_name_prefix="CourseFetchAttempt"
+        ) as pool:
+            try:
+                content_future = loop.run_in_executor(
+                    pool, scrape_course_content, username_for_creds, password_for_creds, normalized_url
+                )
+                announcement_future = loop.run_in_executor(
+                    pool, scrape_course_announcements, username_for_creds, password_for_creds, normalized_url
+                )
 
-    # Run content and announcement fetching concurrently using threads
-    # Limit workers to avoid overwhelming the system or hitting rate limits
-    max_workers_cms = min(4, os.cpu_count() or 1)  # Conservative number of workers
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=max_workers_cms, thread_name_prefix="CourseFetch"
-    ) as pool:
-        try:
-            content_future = loop.run_in_executor(
-                pool, scrape_course_content, username, password, normalized_url
+                content_list = await content_future
+                announcement_result = await announcement_future
+
+                if content_list is not None or announcement_result is not None:
+                    current_attempt_fetch_success = True
+                    fetch_success = True # Mark overall success
+                    if content_list is None:
+                        logger.warning(
+                            f"CMS Content fetch (Attempt {attempt+1}) returned None for {course_name}"
+                        )
+                    if announcement_result is None:
+                        logger.warning(
+                            f"CMS Announcement fetch (Attempt {attempt+1}) returned None for {course_name}"
+                        )
+                    break # Successful attempt, exit retry loop
+                else: # Both are None from this attempt
+                    logger.warning(f"Attempt {attempt+1}: Both content and announcement fetch returned None for {course_name}.")
+
+            except Exception as fetch_exc:
+                logger.error(
+                    f"Exception during concurrent fetch (Attempt {attempt + 1}) for {course_name} ({normalized_url}): {fetch_exc}",
+                    exc_info=True if attempt == max_retries -1 else False, # Full traceback on last attempt
+                )
+        
+        if fetch_success: # If any attempt was successful
+            break 
+
+        if attempt < max_retries - 1:
+            logger.warning(
+                f"Attempt {attempt + 1}/{max_retries} failed for {course_name}. Retrying in {RETRY_DELAY_SECONDS}s..."
             )
-            announcement_future = loop.run_in_executor(
-                pool, scrape_course_announcements, username, password, normalized_url
-            )
-
-            # Await results with a timeout per fetch? Consider adding asyncio.wait_for if needed
-            content_list = await content_future
-            announcement_result = await announcement_future
-
-            # Consider None as non-failure if the other succeeded. Failure only if BOTH failed or threw exception.
-            if content_list is not None or announcement_result is not None:
-                fetch_success = True
-                # Log specific failures if only one part succeeded
-                if content_list is None:
-                    logger.warning(
-                        f"CMS Content fetch returned None for {username} - {course_name}"
-                    )
-                if announcement_result is None:
-                    logger.warning(
-                        f"CMS Announcement fetch returned None for {username} - {course_name}"
-                    )
-
-        except Exception as fetch_exc:
+            await asyncio.sleep(RETRY_DELAY_SECONDS)
+        else:
             logger.error(
-                f"Exception during concurrent fetch for {username} - {course_name} ({normalized_url}): {fetch_exc}",
-                exc_info=True,
+                f"All {max_retries} attempts failed to fetch CMS content for {course_name} ({normalized_url})."
             )
-            fetch_success = False
+            # fetch_success remains False
 
     if not fetch_success:
         logger.warning(
-            f"Both content/announcement fetch failed for {username} - {course_name}. Cache not updated."
+            f"All fetch attempts failed for {course_name}. Cache not updated."
         )
-        return {"status": "failed", "reason": "fetch failed"}
+        return {"status": "failed_fetch_retries", "reason": "fetch failed after retries"}
 
     # --- Assemble data (logic from refresh_cms_content-2.py) ---
     combined_data_for_cache = []
@@ -296,28 +341,28 @@ async def _refresh_single_cms_course(username, password, course_entry):
     # Cache even if only mock week is present, as long as fetch didn't completely fail
     if combined_data_for_cache:
         cache_func = REFRESH_CONFIG["cms_content"]["cache_func"]
-        timeout = REFRESH_CONFIG["cms_content"]["timeout"]
+        timeout = REFRESH_CONFIG["cms_content"]["timeout"] # This is now 1 hour
         if cache_func(cache_key, combined_data_for_cache, timeout=timeout):
             logger.info(
-                f"Successfully refreshed CMS content cache for {username} - {course_name}"
+                f"Successfully refreshed GLOBAL CMS content cache for {course_name} (Key: {cache_key})"
             )
-            return {"status": "updated"}
+            return {"status": "updated", "refreshed_url": normalized_url}
         else:
             logger.error(
-                f"Failed to set CMS content pickle cache for {username} - {course_name}"
+                f"Failed to set GLOBAL CMS content pickle cache for {course_name} (Key: {cache_key})"
             )
-            return {"status": "failed", "reason": "cache set error"}
+            return {"status": "failed_cache_set", "reason": "cache set error"}
     else:
         # This case should ideally not happen if fetch_success is true, but as a safeguard:
         logger.warning(
-            f"Skipped CMS content cache update for {username} - {course_name} - no data assembled."
+            f"Skipped GLOBAL CMS content cache update for {course_name} - no data assembled."
         )
         return {"status": "skipped", "reason": "no data assembled"}
 
 
 # --- Refactored Async Task Runner ---
-async def run_refresh_for_user(username, password, data_types_to_run):
-    """Runs scraping tasks for a user based on requested data types."""
+async def run_refresh_for_user(username, password, data_types_to_run, refreshed_course_urls_this_run: set):
+    """Runs scraping tasks for a user based on requested data types, handling global CMS refresh."""
     user_results = {}
     max_concurrent_fetches = config.MAX_CONCURRENT_FETCHES  # Use config
     current_run_all_update_messages = [] # Initialize list to collect all updates for this user in this run
@@ -326,100 +371,123 @@ async def run_refresh_for_user(username, password, data_types_to_run):
 
     # --- Handle CMS Content Section Separately (Section 4) ---
     if "cms_content" in data_types_to_run:
-        logger.info(f"Initiating deep CMS content refresh for user: {username}")
+        logger.info(f"Processing CMS content section for user: {username}")
         course_list = None
         try:
             loop = asyncio.get_running_loop()
-            # Use run_in_executor for the blocking scrape_cms_courses call
             course_list = await loop.run_in_executor(
                 None, scrape_cms_courses, username, password
             )
         except Exception as e:
             logger.error(
-                f"Failed to fetch course list for {username} during cms_content refresh: {e}",
+                f"Failed to fetch course list for {username} during cms_content processing: {e}",
                 exc_info=True,
             )
-            user_results["cms_content"] = "failed: could not get course list"
-            course_list = None  # Ensure it's None
+            user_results["cms_content"] = "failed: could not get course list for this user"
+            course_list = None
 
         if isinstance(course_list, list) and course_list:
             logger.info(
-                f"Found {len(course_list)} courses for {username}. Creating refresh tasks."
+                f"User {username} has {len(course_list)} courses. Checking against globally refreshed list."
             )
             course_tasks = []
-            # Create tasks but don't run all concurrently if list is huge
-            semaphore = asyncio.Semaphore(
-                max_concurrent_fetches
-            )  # Limit concurrent course fetches
+            semaphore = asyncio.Semaphore(max_concurrent_fetches)
+
+            cms_success_count_for_user = 0
+            cms_skipped_this_run_count_for_user = 0
+            cms_failed_count_for_user = 0
+            cms_skipped_fetch_issues_for_user = 0 # Tracks skips due to URL issues, etc.
 
             async def fetch_with_semaphore(coro):
                 async with semaphore:
                     return await coro
 
             for course_entry in course_list:
+                course_url = course_entry.get("course_url")
+                course_name = course_entry.get("course_name", "unknown")
+                
+                if not course_url:
+                    logger.warning(f"Skipping course with no URL for user {username}: {course_entry}")
+                    cms_skipped_fetch_issues_for_user += 1
+                    continue
+
+                normalized_course_url = normalize_course_url(course_url)
+                if not normalized_course_url:
+                    logger.warning(f"Skipping course with unnormalizable URL '{course_url}' for user {username}")
+                    cms_skipped_fetch_issues_for_user +=1
+                    continue
+
+                if normalized_course_url in refreshed_course_urls_this_run:
+                    logger.info(f"CMS Content for course '{course_name}' ({normalized_course_url}) already refreshed this run. Skipping for user {username}.")
+                    cms_skipped_this_run_count_for_user += 1
+                    continue
+
+                # If not skipped, create task to refresh it globally
+                logger.info(f"Course '{course_name}' ({normalized_course_url}) for user {username} needs global refresh.")
                 task_coro = _refresh_single_cms_course(username, password, course_entry)
-                # Wrap the coroutine call with the semaphore logic
                 task = asyncio.create_task(
                     fetch_with_semaphore(task_coro),
-                    name=f"{username}_cms_{course_entry.get('course_name', 'unknown')}",
+                    name=f"GLOBAL_CMS_{normalized_course_url.split('/')[-1]}", # More generic task name
                 )
                 course_tasks.append(task)
 
-            if course_tasks:
+            if course_tasks: # Only if there are tasks to run for global refresh initiated by this user
+                logger.info(f"Awaiting {len(course_tasks)} global CMS refresh tasks initiated by {username}.")
                 course_results_list = await asyncio.gather(
                     *course_tasks, return_exceptions=True
                 )
-                success_count = 0
-                skipped_count = 0
-                failed_count = 0
+                
                 for res in course_results_list:
                     if isinstance(res, Exception):
-                        failed_count += 1
-                        # Log the specific exception from gather results
+                        cms_failed_count_for_user += 1
                         logger.error(
-                            f"CMS Content course task failed with exception for {username}: {res}"
+                            f"A global CMS Content course task (initiated by {username}) failed with exception: {res}"
                         )
                     elif isinstance(res, dict):
                         status = res.get("status", "unknown")
-                        if status == "updated":
-                            success_count += 1
-                        elif status == "skipped":
-                            skipped_count += 1
-                        elif status == "failed":
-                            failed_count += 1
-                        else:  # Handle unknown status as failure
-                            failed_count += 1
-                            logger.warning(
-                                f"CMS Content course task for {username} returned unknown status: {status}"
-                            )
-                    else:  # Handle unexpected return type as failure
-                        failed_count += 1
-                        logger.error(
-                            f"CMS Content course task for {username} returned unexpected type: {type(res)}"
-                        )
+                        refreshed_url_val = res.get("refreshed_url")
 
-                summary = f"updated={success_count}, skipped={skipped_count}, failed={failed_count}"
-                user_results["cms_content"] = summary
-                logger.info(f"CMS Content refresh summary for {username}: {summary}")
-            else:
-                user_results["cms_content"] = (
-                    "skipped: no course tasks created (list might be empty or filtered)"
-                )
+                        if status == "updated" and refreshed_url_val:
+                            cms_success_count_for_user += 1
+                            refreshed_course_urls_this_run.add(refreshed_url_val) # Add to global set
+                            logger.info(f"Global refresh for {refreshed_url_val} (initiated by {username}) successful.")
+                        elif status == "skipped": # Skipped by _refresh_single_cms_course (e.g. missing URL in entry)
+                            cms_skipped_fetch_issues_for_user += 1
+                        elif status in ["failed_fetch_retries", "failed_cache_set", "failed"]:
+                            cms_failed_count_for_user += 1
+                        else:
+                            cms_failed_count_for_user += 1
+                            logger.warning(
+                                f"Global CMS Content course task (initiated by {username}) returned unknown status: {status}"
+                            )
+                    else:
+                        cms_failed_count_for_user += 1
+                        logger.error(
+                            f"Global CMS Content course task (initiated by {username}) returned unexpected type: {type(res)}"
+                        )
+            
+            summary = (
+                f"Processed for user {username}: "
+                f"Globally Updated Now={cms_success_count_for_user}, "
+                f"Skipped (already updated this run)={cms_skipped_this_run_count_for_user}, "
+                f"Global Fails Now={cms_failed_count_for_user}, "
+                f"Skipped (fetch/URL issues)={cms_skipped_fetch_issues_for_user}"
+            )
+            user_results["cms_content"] = summary
+            logger.info(f"CMS Content processing summary for user {username}: {summary}")
+
         elif isinstance(course_list, dict) and "error" in course_list:
-            # Handle error from scrape_cms_courses itself
             error_msg = course_list["error"]
-            user_results["cms_content"] = f"failed: {error_msg}"
-            logger.warning(f"Fetching course list failed for {username}: {error_msg}")
-        elif isinstance(course_list, list) and not course_list:  # Empty list returned
-            user_results["cms_content"] = "skipped: no courses found"
-        elif (
-            course_list is None and "cms_content" not in user_results
-        ):  # Already logged fetch error above
-            pass  # Result already set to failure
-        else:  # Unexpected type
-            user_results["cms_content"] = "failed: unexpected course list format"
+            user_results["cms_content"] = f"failed to list courses for user: {error_msg}"
+            logger.warning(f"Fetching course list failed for user {username}: {error_msg}")
+        elif isinstance(course_list, list) and not course_list:
+            user_results["cms_content"] = "skipped: user has no courses listed"
+        elif course_list is None and "cms_content" not in user_results:
+            pass
+        else:
+            user_results["cms_content"] = "failed: unexpected course list format for user"
             logger.error(
-                f"Unexpected course list format for {username}: {type(course_list)}"
+                f"Unexpected course list format for user {username}: {type(course_list)}"
             )
 
         # Remove 'cms_content' from data_types_to_run if processed
@@ -745,17 +813,21 @@ async def main():
     overall_results = {}
     # Limit concurrent users being processed simultaneously if needed
     user_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_USERS)
+    refreshed_course_urls_this_run = set() # Initialize set for courses refreshed in this run
 
-    async def process_user_with_semaphore(username, password, data_types):
+    async def process_user_with_semaphore(username, password, data_types, refreshed_urls_set):
         async with user_semaphore:
             logger.info(f"Starting processing for user: {username}")
-            result = await run_refresh_for_user(username, password, data_types)
+            result = await run_refresh_for_user(username, password, data_types, refreshed_urls_set)
             logger.info(f"Finished processing for user: {username}")
             return result
 
     user_refresh_coroutines = [
         process_user_with_semaphore(
-            username, password, list(data_types_to_run)  # Pass a copy of the list
+            username, 
+            password, 
+            list(data_types_to_run), # Pass a copy of the list
+            refreshed_course_urls_this_run # Pass the shared set
         )
         for username, password in users_to_process.items()
     ]
@@ -800,6 +872,24 @@ async def main():
     # Determine the data types actually expected to run (excluding cms_content for summary counts)
     summary_data_types = [dt for dt in data_types_to_run if dt != "cms_content"]
 
+    # Specific tracking for global CMS refreshes if section 4 was run
+    total_cms_courses_globally_updated_this_run = 0
+    total_cms_courses_globally_failed_this_run = 0 # Tracks actual refresh failures
+    
+    if "cms_content" in data_types_to_run:
+        # The set `refreshed_course_urls_this_run` contains successfully updated unique courses.
+        # We need to sum up failures from individual user's attempts to initiate global refreshes.
+        # This is tricky because `overall_results` contains per-user summaries of *their contribution* to global refresh.
+        # A simpler global metric might be the size of `refreshed_course_urls_this_run` for successes.
+        # Failures are harder to aggregate without double counting if multiple users triggered a fail for the same course.
+        # For now, we rely on the per-user logging and the final size of the refreshed set.
+        total_cms_courses_globally_updated_this_run = len(refreshed_course_urls_this_run)
+        
+        # To get total global failures, we'd need to parse the complex summary strings.
+        # Let's log the number of unique courses updated this run.
+        # The individual user logs from `run_refresh_for_user` for cms_content will give more detail.
+        pass # Detailed parsing of individual user cms_content results for global sum is complex here
+
     for username, results in overall_results.items():
         user_summary_parts = []
         if results.get("error"):
@@ -817,46 +907,16 @@ async def main():
                 total_items_processed += 1  # Increment total items processed
 
                 if data_type == "cms_content":
-                    # Parse the summary string like "updated=5, skipped=1, failed=0"
-                    if isinstance(status, str) and "=" in status:
-                        try:
-                            parts = status.split(", ")
-                            for part in parts:
-                                k, v_str = part.split("=")
-                                v = int(v_str)
-                                if k in cms_content_stats:
-                                    cms_content_stats[k] += v
-                                else:
-                                    logger.warning(
-                                        f"Unknown key '{k}' in cms_content status for {username}"
-                                    )
-                        except Exception as e_parse:
-                            logger.error(
-                                f"Failed to parse cms_content status '{status}' for {username}: {e_parse}"
-                            )
-                            # Treat unparseable string status as failed?
-                            total_failed += 1  # Count the overall cms_content task as failed if status is bad
-                    elif (
-                        status == "updated"
-                    ):  # Fallback if status isn't the detailed string
-                        cms_content_stats[
-                            "updated"
-                        ] += 1  # Assume 1 course if not detailed? Or just skip? Let's skip detailed count here.
-                        total_updated += 1
-                    elif "skipped" in status:
-                        cms_content_stats["skipped"] += 1
-                        total_skipped += 1
-                    elif "failed" in status:
-                        cms_content_stats["failed"] += 1
-                        total_failed += 1
-                    elif status == "not_run":
-                        total_failed += 1  # Count not_run as failed
-                    else:
-                        logger.warning(
-                            f"Unknown cms_content status '{status}' for {username}"
-                        )
-                        total_failed += 1  # Count unknown status as failed
-
+                    # The status for cms_content is now a more complex string per user
+                    # reflecting their interaction with the global refresh process.
+                    # Example: "Processed for user X: Globally Updated Now=1, Skipped (already updated this run)=2, ..."
+                    # We don't try to sum these up into the old cms_content_stats buckets here,
+                    # as the meaning has changed. The new global count is separate.
+                    if isinstance(status, str): # Should be the summary string
+                        pass # Already logged per user, and global summary is separate
+                    else: # Fallback if status isn't the detailed string
+                        logger.warning(f"Unexpected cms_content status format for {username}: {status}")
+                        total_failed +=1 # Count this user's cms_content "task" as failed in overall user stats
                 else:  # Handle non-cms_content types
                     if status == "updated":
                         total_updated += 1
@@ -881,10 +941,13 @@ async def main():
     )
     if "cms_content" in data_types_to_run:
         logger.info(
-            f"CMS Content Courses Summary: Updated={cms_content_stats['updated']}, Skipped={cms_content_stats['skipped']}, Failed={cms_content_stats['failed']}"
+            f"CMS Content Global Summary: Total unique courses successfully refreshed and cached this run = {total_cms_courses_globally_updated_this_run}"
         )
-        # Adjust total counts to exclude the cms_content *task* itself if we only count courses?
-        # Let's keep the total simple: counts the main task status for each data type requested.
+        # Old cms_content_stats is no longer directly applicable for global summary.
+        # logger.info(
+        #     f"CMS Content Courses Summary: Updated={cms_content_stats['updated']}, Skipped={cms_content_stats['skipped']}, Failed={cms_content_stats['failed']}"
+        # )
+
     # Recalculate non-CMS totals based ONLY on summary_data_types status
     non_cms_updated = 0
     non_cms_skipped = 0
