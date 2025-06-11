@@ -38,7 +38,7 @@ def get_redis_logs():
 def analyze_log_chunk(log_chunk_text, chunk_info, total_chunks):
     """Sends a single log chunk to the AI for analysis and returns the report."""
     client = genai.Client(
-        api_key="AIzaSyAzSzm1L2ECUy_5Dm5hkMnvB-hozyMw5RI", # Use environment variable
+        api_key="", # Use environment variable
     )
 
     model = "gemini-2.0-flash" # Use the model specified by the user
