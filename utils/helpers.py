@@ -200,7 +200,7 @@ def guess_content_type(filename: str) -> str:
 _memory_cache = {}
 _memory_cache_ttl = {}
 _memory_cache_lock = threading.Lock()
-MEMORY_CACHE_SHORT_TTL = 60  # seconds (e.g., 1 minute for version/announcement)
+MEMORY_CACHE_SHORT_TTL = 5  # seconds (e.g., 1 minute for version/announcement)
 
 
 def get_from_memory_cache(key: str):

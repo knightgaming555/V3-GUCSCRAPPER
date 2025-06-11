@@ -117,6 +117,30 @@ def store_user_credentials(username: str, password: str) -> bool:
     return False
 
 
+def user_has_stored_credentials(username: str) -> bool:
+    """
+    Checks if a user has stored credentials.
+    Returns True if credentials exist, False otherwise.
+    """
+    if not redis_client:
+        logger.error("Redis client unavailable for user_has_stored_credentials.")
+        return False
+
+    try:
+        exists = redis_client.hexists(USER_CREDENTIALS_HASH, username)
+        return bool(exists)
+    except redis.exceptions.ConnectionError as e:
+        logger.error(
+            f"[Redis] Connection error checking credentials existence for {username}: {e}"
+        )
+        return False
+    except Exception as e:
+        logger.error(
+            f"Error checking credentials existence for user '{username}': {e}", exc_info=True
+        )
+        return False
+
+
 def validate_credentials_flow(
     username: str, password: str, first_time: bool = False
 ) -> str:
@@ -148,9 +172,15 @@ def validate_credentials_flow(
             logger.error(
                 f"Error during first time auth check for {username}: {e}", exc_info=True
             )
-            raise AuthError(
-                f"Authentication check failed: {e}", 503, "first_time_auth_exception"
-            ) from e
+            # Check if the exception is related to authentication
+            error_msg = str(e).lower()
+            if "auth" in error_msg or "login failed" in error_msg or "credentials" in error_msg or "password" in error_msg or "invalid" in error_msg or "401" in error_msg:
+                raise AuthError("Invalid credentials", 401, "first_time_auth_fail") from e
+            else:
+                # Only use 503 for actual server/connection issues
+                raise AuthError(
+                    f"Authentication check failed: {e}", 503, "first_time_auth_exception"
+                ) from e
     elif stored_password:
         # Not first time, user exists in store
         if stored_password.strip() == password.strip():
@@ -178,9 +208,15 @@ def validate_credentials_flow(
                 logger.error(
                     f"Error during GUC re-auth check for {username}: {e}", exc_info=True
                 )
-                raise AuthError(
-                    f"Authentication check failed: {e}", 503, "stored_auth_exception"
-                ) from e
+                # Check if the exception is related to authentication
+                error_msg = str(e).lower()
+                if "auth" in error_msg or "login failed" in error_msg or "credentials" in error_msg or "password" in error_msg or "invalid" in error_msg or "401" in error_msg:
+                    raise AuthError("Invalid credentials", 401, "stored_auth_fail_mismatch") from e
+                else:
+                    # Only use 503 for actual server/connection issues
+                    raise AuthError(
+                        f"Authentication check failed: {e}", 503, "stored_auth_exception"
+                    ) from e
     else:
         # Not first time, but user *not* found in store (e.g., cache cleared, or never logged in before despite first_time=false)
         logger.info(
@@ -203,11 +239,17 @@ def validate_credentials_flow(
                 f"Error during GUC auth for non-stored user {username}: {e}",
                 exc_info=True,
             )
-            raise AuthError(
-                f"Authentication check failed: {e}",
-                503,
-                "non_first_time_auth_exception",
-            ) from e
+            # Check if the exception is related to authentication
+            error_msg = str(e).lower()
+            if "auth" in error_msg or "login failed" in error_msg or "credentials" in error_msg or "password" in error_msg or "invalid" in error_msg or "401" in error_msg:
+                raise AuthError("Invalid credentials", 401, "non_first_time_auth_fail") from e
+            else:
+                # Only use 503 for actual server/connection issues
+                raise AuthError(
+                    f"Authentication check failed: {e}",
+                    503,
+                    "non_first_time_auth_exception",
+                ) from e
 
     if not password_to_use:
         # This should theoretically not be reached if logic is correct
@@ -333,3 +375,38 @@ def set_whitelist(users: list[str]) -> bool:
     except Exception as e:
         logger.error(f"Error setting whitelist: {e}", exc_info=True)
     return False
+
+
+def get_password_for_readonly_session(username: str, password_provided: str) -> str:
+    """
+    Authenticates a user for a read-only session.
+    Checks against stored password if available, or GUC if not.
+    NEVER stores or updates credentials.
+    Returns the password to use for the session if auth is successful.
+    Raises AuthError on failure.
+    """
+    if not username or not password_provided: # Basic check
+        logger.warning("Readonly Auth: Username or password not provided.")
+        raise AuthError("Username or password not provided", 400, "readonly_auth_missing_params")
+
+    stored_password = get_stored_password(username)
+
+    if stored_password:
+        if stored_password == password_provided:
+            logger.debug(f"Readonly Auth: Provided password matches stored for {username}.")
+            return stored_password  # Use the validated stored password
+        else:
+            logger.warning(f"Readonly Auth: Provided password for {username} does not match stored. Access denied.")
+            raise AuthError("Invalid credentials", 401, "readonly_stored_pw_mismatch")
+    else:
+        # No stored password, GUC check for session only, no storing.
+        logger.info(f"Readonly Auth: No stored credentials for {username}. Attempting direct GUC auth for session only.")
+        # Ensure authenticate_user is available in this scope
+        # It's imported at the top of utils/auth.py as: from scraping.authenticate import authenticate_user
+        auth_success = authenticate_user(username, password_provided)
+        if auth_success:
+            logger.info(f"Readonly Auth: Direct GUC authentication successful for {username}.")
+            return password_provided # Use the GUC-validated provided password
+        else:
+            logger.warning(f"Readonly Auth: Direct GUC authentication failed for {username}.")
+            raise AuthError("Invalid credentials", 401, "readonly_direct_auth_fail")
