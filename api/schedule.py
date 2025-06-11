@@ -28,6 +28,43 @@ TIMINGS = {
 }
 
 
+def is_schedule_empty(schedule_data: dict) -> bool:
+    """
+    Check if a schedule contains any meaningful course data.
+
+    Returns True if all Course_Name fields are empty, "Unknown", "Free", "N/A",
+    or if the schedule is completely empty.
+
+    Args:
+        schedule_data: The filtered schedule dictionary
+
+    Returns:
+        bool: True if schedule is considered empty, False otherwise
+    """
+    if not schedule_data or not isinstance(schedule_data, dict):
+        return True
+
+    # Values that indicate no meaningful course data
+    empty_values = {"", "Unknown", "Free", "N/A", "Error", "Parsing Failed"}
+
+    for day, periods in schedule_data.items():
+        if not isinstance(periods, dict):
+            continue
+
+        for period_name, period_details in periods.items():
+            if not isinstance(period_details, dict):
+                continue
+
+            course_name = period_details.get("Course_Name", "")
+            # If we find any course name that's not in the empty values set,
+            # the schedule has meaningful data
+            if course_name not in empty_values:
+                return False
+
+    # All course names were empty/unknown/free, so schedule is considered empty
+    return True
+
+
 @schedule_bp.route("/schedule", methods=["GET"])
 def api_schedule():
     """
@@ -67,8 +104,13 @@ def api_schedule():
         cached_data = get_from_cache(cache_key)
 
         if cached_data:
+            # Check if cached data is an empty array (empty schedule)
+            if isinstance(cached_data, list) and len(cached_data) == 0:
+                logger.info(f"Serving empty schedule from cache for {username}")
+                g.log_outcome = "cache_hit_empty_schedule"
+                return jsonify([]), 200
             # Validate cached data structure (should be a list/tuple of length 2)
-            if isinstance(cached_data, (list, tuple)) and len(cached_data) == 2:
+            elif isinstance(cached_data, (list, tuple)) and len(cached_data) == 2:
                 logger.info(f"Serving schedule from cache for {username}")
                 g.log_outcome = "cache_hit"
                 # Return the cached tuple directly
@@ -142,6 +184,19 @@ def api_schedule():
 
             # Filter the raw data
             filtered_data = filter_schedule_details(raw_schedule_data)
+
+            # Check if the schedule is empty (no meaningful course data)
+            if is_schedule_empty(filtered_data):
+                logger.info(f"Schedule for {username} contains no meaningful course data, returning empty array")
+                g.log_outcome = "scrape_success_empty_schedule"
+
+                # Cache the empty result
+                set_in_cache(
+                    cache_key, [], timeout=config.CACHE_LONG_TIMEOUT
+                )  # Cache empty array
+                logger.info(f"Cached empty schedule for {username}")
+
+                return jsonify([]), 200
 
             # Prepare the response tuple (filtered_schedule, timings)
             response_data = (filtered_data, TIMINGS)
