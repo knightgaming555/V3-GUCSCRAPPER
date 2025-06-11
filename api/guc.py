@@ -69,7 +69,9 @@ def _beautify_grade_updates_body(messages_list: list[str]) -> str:
             # parts[2] is the grade detail, e.g., "discussion 1: 3.5/5 (was 3.5 / 5)"
             course_identifier = parts[1].strip()
             grade_detail = parts[2].strip()
-            courses[course_identifier].append(grade_detail)
+            # Remove the "(was ...)" part from the grade detail
+            cleaned_grade_detail = grade_detail.split("(was")[0].strip()
+            courses[course_identifier].append(cleaned_grade_detail)
         else:
             # Fallback for lines not matching the expected format
             courses["Miscellaneous Updates"].append(message)
@@ -216,73 +218,13 @@ def api_guc_data():
                 if not isinstance(original_guc_notifications, list):
                     original_guc_notifications = []
                 
-                # Prepare user-specific notifications (or placeholder)
-                user_specific_notifications_structured = [] # This will hold the single card, or be empty if no card
-                if username in TARGET_NOTIFICATION_USERS:
-                    user_notif_cache_key = f"user_notifications_{username}"
-                    fetched_user_updates_batches = get_from_cache(user_notif_cache_key) or []
-                    logger.info(f"Attempting to fetch user-specific notification batches for {username} from key: {user_notif_cache_key}")
-                    if fetched_user_updates_batches:
-                        logger.info(f"Found {len(fetched_user_updates_batches)} batch(es) of user-specific notifications for {username}.")
-                    else:
-                        logger.info(f"No user-specific notification batches found in cache for {username}.")
-
-                    if isinstance(fetched_user_updates_batches, list) and fetched_user_updates_batches:
-                        latest_batch = fetched_user_updates_batches[0] # Get the most recent batch
-                        if isinstance(latest_batch, dict) and latest_batch.get("messages") and latest_batch.get("timestamp"):
-                            messages_list = latest_batch["messages"]
-                            # Beautify the messages list
-                            beautified_content = _beautify_grade_updates_body(messages_list)
-                            messages_body = beautified_content
-                            # Append department info if there's actual content
-                            if beautified_content != "No specific updates available.":
-                                messages_body += "\n\nDepartment: Unisight System"
-                            timestamp_str = latest_batch["timestamp"]
-                            try:
-                                dt_obj = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M")
-                                formatted_date = dt_obj.strftime("%m/%d/%Y")
-                                formatted_email_time = dt_obj.strftime("%Y-%m-%dT%H:%M:%S")
-                            except ValueError:
-                                formatted_date = timestamp_str # fallback
-                                formatted_email_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%S") # fallback to now if timestamp unparseable
-
-                            user_specific_notifications_structured.append({
-                                "id": str(800000), # Dedicated ID for the consolidated user updates card
-                                "title": "Your Updates",
-                                "subject": "Your latest update", # Changed subject line
-                                "body": messages_body,
-                                "date": formatted_date,
-                                "email_time": formatted_email_time,
-                                "staff": "Unisight System",
-                                "importance": "Normal"
-                            })
-                        else:
-                            logger.warning(f"Latest batch for {username} has unexpected format: {latest_batch}")
-                            # Potentially add placeholder if latest batch is corrupt but others exist?
-                            # For now, if latest is bad, we'll fall through to placeholder if this list remains empty.
-                    
-                    # If after trying to process batches, list is still empty, add placeholder
-                    if not user_specific_notifications_structured:
-                        now = datetime.now()
-                        user_specific_notifications_structured.append({
-                            "id": str(777777),
-                            "title": "No New Updates", 
-                            "subject": "No new notifications for you at this time.", 
-                            "body": "Nothing new to see here!\n\nDepartment: Unisight System", # Append department info to placeholder too
-                            "date": now.strftime("%m/%d/%Y"),
-                            "email_time": now.strftime("%Y-%m-%dT%H:%M:%S"),
-                            "staff": "Unisight System",
-                            "importance": "Normal"
-                        })
-                
                 # Construct final notifications list in desired order
                 final_notifications_list = []
                 if dev_announcement: # Ensure dev_announcement is not None
-                     # Avoid adding duplicate dev_announcement if it was already in original_guc_notifications
+                    # Avoid adding duplicate dev_announcement if it was already in original_guc_notifications
                     if not any(n.get("id") == dev_announcement.get("id") for n in original_guc_notifications):
                         final_notifications_list.append(dev_announcement)
                 
-                final_notifications_list.extend(user_specific_notifications_structured) # Add user-specific (or placeholder)
                 final_notifications_list.extend(original_guc_notifications) # Add original GUC notifications
                 
                 cached_data["notifications"] = final_notifications_list
@@ -368,63 +310,63 @@ def api_guc_data():
                     original_guc_notifications = []
 
                 # Prepare user-specific notifications (or placeholder)
-                user_specific_notifications_structured = [] # This will hold the single card, or be empty if no card
-                if username in TARGET_NOTIFICATION_USERS:
-                    user_notif_cache_key = f"user_notifications_{username}"
-                    fetched_user_updates_batches = get_from_cache(user_notif_cache_key) or []
-                    logger.info(f"Attempting to fetch user-specific notification batches for {username} from key: {user_notif_cache_key}")
-                    if fetched_user_updates_batches:
-                        logger.info(f"Found {len(fetched_user_updates_batches)} batch(es) of user-specific notifications for {username}.")
-                    else:
-                        logger.info(f"No user-specific notification batches found in cache for {username}.")
+                # user_specific_notifications_structured = [] # This will hold the single card, or be empty if no card
+                # if username in TARGET_NOTIFICATION_USERS:
+                #     user_notif_cache_key = f"user_notifications_{username}"
+                #     fetched_user_updates_batches = get_from_cache(user_notif_cache_key) or []
+                #     logger.info(f"Attempting to fetch user-specific notification batches for {username} from key: {user_notif_cache_key}")
+                #     if fetched_user_updates_batches:
+                #         logger.info(f"Found {len(fetched_user_updates_batches)} batch(es) of user-specific notifications for {username}.")
+                #     else:
+                #         logger.info(f"No user-specific notification batches found in cache for {username}.")
 
-                    if isinstance(fetched_user_updates_batches, list) and fetched_user_updates_batches:
-                        latest_batch = fetched_user_updates_batches[0] # Get the most recent batch
-                        if isinstance(latest_batch, dict) and latest_batch.get("messages") and latest_batch.get("timestamp"):
-                            messages_list = latest_batch["messages"]
-                            # Beautify the messages list
-                            beautified_content = _beautify_grade_updates_body(messages_list)
-                            messages_body = beautified_content
-                            # Append department info if there's actual content
-                            if beautified_content != "No specific updates available.":
-                                messages_body += "\n\nDepartment: Unisight System"
-                            timestamp_str = latest_batch["timestamp"]
-                            try:
-                                dt_obj = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M")
-                                formatted_date = dt_obj.strftime("%m/%d/%Y")
-                                formatted_email_time = dt_obj.strftime("%Y-%m-%dT%H:%M:%S")
-                            except ValueError:
-                                formatted_date = timestamp_str # fallback
-                                formatted_email_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%S") # fallback to now if timestamp unparseable
+                #     if isinstance(fetched_user_updates_batches, list) and fetched_user_updates_batches:
+                #         latest_batch = fetched_user_updates_batches[0] # Get the most recent batch
+                #         if isinstance(latest_batch, dict) and latest_batch.get("messages") and latest_batch.get("timestamp"):
+                #             messages_list = latest_batch["messages"]
+                #             # Beautify the messages list
+                #             beautified_content = _beautify_grade_updates_body(messages_list)
+                #             messages_body = beautified_content
+                #             # Append department info if there's actual content
+                #             if beautified_content != "No specific updates available.":
+                #                 messages_body += "\n\nDepartment: Unisight System"
+                #             timestamp_str = latest_batch["timestamp"]
+                #             try:
+                #                 dt_obj = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M")
+                #                 formatted_date = dt_obj.strftime("%m/%d/%Y")
+                #                 formatted_email_time = dt_obj.strftime("%Y-%m-%dT%H:%M:%S")
+                #             except ValueError:
+                #                 formatted_date = timestamp_str # fallback
+                #                 formatted_email_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%S") # fallback to now if timestamp unparseable
 
-                            user_specific_notifications_structured.append({
-                                "id": str(800000), # Dedicated ID for the consolidated user updates card
-                                "title": "Your Updates",
-                                "subject": "Your latest update", # Changed subject line
-                                "body": messages_body,
-                                "date": formatted_date,
-                                "email_time": formatted_email_time,
-                                "staff": "Unisight System",
-                                "importance": "Normal"
-                            })
-                        else:
-                            logger.warning(f"Latest batch for {username} has unexpected format: {latest_batch}")
-                            # Potentially add placeholder if latest batch is corrupt but others exist?
-                            # For now, if latest is bad, we'll fall through to placeholder if this list remains empty.
+                #             user_specific_notifications_structured.append({
+                #                 "id": str(800000), # Dedicated ID for the consolidated user updates card
+                #                 "title": "Your Updates",
+                #                 "subject": "Your latest update", # Changed subject line
+                #                 "body": messages_body,
+                #                 "date": formatted_date,
+                #                 "email_time": formatted_email_time,
+                #                 "staff": "Unisight System",
+                #                 "importance": "Normal"
+                #             })
+                #         else:
+                #             logger.warning(f"Latest batch for {username} has unexpected format: {latest_batch}")
+                #             # Potentially add placeholder if latest batch is corrupt but others exist?
+                #             # For now, if latest is bad, we'll fall through to placeholder if this list remains empty.
                     
-                    # If after trying to process batches, list is still empty, add placeholder
-                    if not user_specific_notifications_structured:
-                        now = datetime.now()
-                        user_specific_notifications_structured.append({
-                            "id": str(777777),
-                            "title": "No New Updates", 
-                            "subject": "No new notifications for you at this time.", 
-                            "body": "Nothing new to see here!\n\nDepartment: Unisight System", # Append department info to placeholder too
-                            "date": now.strftime("%m/%d/%Y"),
-                            "email_time": now.strftime("%Y-%m-%dT%H:%M:%S"),
-                            "staff": "Unisight System",
-                            "importance": "Normal"
-                        })
+                #     # If after trying to process batches, list is still empty, add placeholder
+                #     if not user_specific_notifications_structured:
+                #         now = datetime.now()
+                #         user_specific_notifications_structured.append({
+                #             "id": str(777777),
+                #             "title": "No New Updates", 
+                #             "subject": "No new notifications for you at this time.", 
+                #             "body": "Nothing new to see here!\n\nDepartment: Unisight System", # Append department info to placeholder too
+                #             "date": now.strftime("%m/%d/%Y"),
+                #             "email_time": now.strftime("%Y-%m-%dT%H:%M:%S"),
+                #             "staff": "Unisight System",
+                #             "importance": "Normal"
+                #         })
                 
                 # Construct final notifications list in desired order
                 final_notifications_list = []
@@ -433,7 +375,7 @@ def api_guc_data():
                     if not any(n.get("id") == dev_announcement.get("id") for n in original_guc_notifications):
                         final_notifications_list.append(dev_announcement)
                 
-                final_notifications_list.extend(user_specific_notifications_structured) # Add user-specific (or placeholder)
+                # final_notifications_list.extend(user_specific_notifications_structured) # Add user-specific (or placeholder)
                 final_notifications_list.extend(original_guc_notifications) # Add original GUC notifications
                 
                 scrape_result["notifications"] = final_notifications_list
