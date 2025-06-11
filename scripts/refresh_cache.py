@@ -157,14 +157,15 @@ def _is_cms_content_substantial(content_data: list) -> bool:
                 continue
 
             # Check if this is a week with actual content
-            if "week_title" in item and "week_content" in item:
-                week_content = item.get("week_content", [])
-                if isinstance(week_content, list) and len(week_content) > 0:
+            # The actual CMS data structure uses "week_name" and "contents" keys
+            if "week_name" in item and "contents" in item:
+                week_contents = item.get("contents", [])
+                if isinstance(week_contents, list) and len(week_contents) > 0:
                     # Check if it's not just a mock week
-                    week_title = item.get("week_title", "").lower()
-                    if "mock" not in week_title and "placeholder" not in week_title:
+                    week_name = item.get("week_name", "").lower()
+                    if "mock" not in week_name and "placeholder" not in week_name:
                         actual_content_weeks += 1
-                        total_materials += len(week_content)
+                        total_materials += len(week_contents)
 
     # Consider content substantial if it has at least 1 real week with materials
     # or at least 3 total materials across weeks
