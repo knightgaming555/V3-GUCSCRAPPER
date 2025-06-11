@@ -104,16 +104,16 @@ def api_schedule():
         cached_data = get_from_cache(cache_key)
 
         if cached_data:
-            # Check if cached data is an empty array (empty schedule)
-            if isinstance(cached_data, list) and len(cached_data) == 0:
-                logger.info(f"Serving empty schedule from cache for {username}")
-                g.log_outcome = "cache_hit_empty_schedule"
-                return jsonify([]), 200
             # Validate cached data structure (should be a list/tuple of length 2)
-            elif isinstance(cached_data, (list, tuple)) and len(cached_data) == 2:
-                logger.info(f"Serving schedule from cache for {username}")
-                g.log_outcome = "cache_hit"
-                # Return the cached tuple directly
+            if isinstance(cached_data, (list, tuple)) and len(cached_data) == 2:
+                # Check if it's an empty schedule (first element is empty dict)
+                if isinstance(cached_data[0], dict) and len(cached_data[0]) == 0:
+                    logger.info(f"Serving empty schedule from cache for {username}")
+                    g.log_outcome = "cache_hit_empty_schedule"
+                else:
+                    logger.info(f"Serving schedule from cache for {username}")
+                    g.log_outcome = "cache_hit"
+                # Return the cached tuple directly (whether empty or full)
                 return jsonify(cached_data), 200
             else:
                 logger.warning(
@@ -187,16 +187,19 @@ def api_schedule():
 
             # Check if the schedule is empty (no meaningful course data)
             if is_schedule_empty(filtered_data):
-                logger.info(f"Schedule for {username} contains no meaningful course data, returning empty array")
+                logger.info(f"Schedule for {username} contains no meaningful course data, returning empty schedule with timings")
                 g.log_outcome = "scrape_success_empty_schedule"
+
+                # Prepare empty schedule response (empty schedule object with timings)
+                empty_schedule_response = ({}, TIMINGS)
 
                 # Cache the empty result
                 set_in_cache(
-                    cache_key, [], timeout=config.CACHE_LONG_TIMEOUT
-                )  # Cache empty array
+                    cache_key, empty_schedule_response, timeout=config.CACHE_LONG_TIMEOUT
+                )  # Cache empty schedule with timings
                 logger.info(f"Cached empty schedule for {username}")
 
-                return jsonify([]), 200
+                return jsonify(empty_schedule_response), 200
 
             # Prepare the response tuple (filtered_schedule, timings)
             response_data = (filtered_data, TIMINGS)
