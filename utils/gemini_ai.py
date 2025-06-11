@@ -16,7 +16,7 @@ from google.genai.errors import ServerError
 logger = logging.getLogger(__name__)
 
 # Initialize the Gemini AI client with the API key
-API_KEY = "AIzaSyAzSzm1L2ECUy_5Dm5hkMnvB-hozyMw5RI"
+API_KEY = ""
 
 # Maximum retries for API calls
 MAX_RETRIES = 3
