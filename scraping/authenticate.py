@@ -95,3 +95,58 @@ def authenticate_user(username: str, password: str, domain: str = "GUC") -> bool
             f"Authentication failed for user: {username} (Request failed after retries)"
         )
         return False
+
+def authenticate_user_session(username: str, password: str, domain: str = "GUC") -> requests.Session | None:
+    """
+    Authenticates a user and returns the authenticated session object.
+
+    Args:
+        username (str): User's university ID.
+        password (str): User's password.
+        domain (str): The NTLM domain (default: "GUC").
+
+    Returns:
+        requests.Session | None: Authenticated session object if successful, None otherwise.
+    """
+    if not username or not password:
+        logger.warning("authenticate_user_session called with empty username or password.")
+        return None
+
+    # Create a session using the same mechanism as authenticate_user
+    session = create_session(username=username, password=password, domain=domain)
+    auth_check_url = config.GUC_INDEX_URL
+    auth_timeout = (10, 20)  # Slightly longer timeout for session creation auth check, (connect, read)
+
+    logger.info(f"Attempting to create authenticated session for user: {username}")
+    response = make_request(session, auth_check_url, method="GET", timeout=auth_timeout)
+
+    if response and response.status_code == 200:
+        # Primary check: Presence of a keyword indicating successful login
+        # Adjust this keyword based on actual GUC portal logged-in state
+        # Common keywords: "Welcome", "Logout", user's name, etc.
+        # For now, using "Welcome" as in the original authenticate_user function
+        if "Welcome" in response.text:
+            logger.info(f"Authenticated session created successfully for user: {username}")
+            return session
+        else:
+            # Secondary check: Absence of login form elements if primary check fails
+            soup_login_check = BeautifulSoup(response.text, "lxml")  # Using lxml as in original
+            login_form = soup_login_check.find("form", action=lambda x: x and "login" in x.lower())
+            if login_form:
+                logger.warning(f"Session authentication failed for {username}: Landed on login page despite 200 OK.")
+                return None
+            else:
+                # If no "Welcome" and no explicit login form, it's ambiguous.
+                # The original authenticate_user had a lenient case here.
+                # For session creation, we might want to be stricter or log more verbosely.
+                logger.warning(
+                    f"Session authentication for {username} returned 200 OK but without clear success indicators (e.g., 'Welcome') or login form. \
+                    Returning session, but verify GUC portal behavior."
+                )
+                return session  # Or return None if this state is considered a failure
+
+    logger.error(
+        f"Session authentication failed for user: {username}. \
+        Response status: {response.status_code if response else 'No response/Request failed after retries'}"
+    )
+    return None
