@@ -613,19 +613,20 @@ async def run_refresh_for_user(username, password, data_types_to_run, refreshed_
                     try:
                         filtered = filter_schedule_details(final_data)
 
+                        # Define timings directly here or import from config/constants
+                        timings = {
+                            "0": "8:15AM-9:45AM",
+                            "1": "10:00AM-11:30AM",
+                            "2": "11:45AM-1:15PM",
+                            "3": "1:45PM-3:15PM",
+                            "4": "3:45PM-5:15PM",
+                        }
+
                         # Check if the schedule is empty (no meaningful course data)
                         if is_schedule_empty(filtered):
-                            logger.info(f"Schedule for {username} contains no meaningful course data, caching empty array")
-                            data_to_cache = []  # Store empty array instead of tuple
+                            logger.info(f"Schedule for {username} contains no meaningful course data, caching empty schedule with timings")
+                            data_to_cache = ({}, timings)  # Store empty dict with timings
                         else:
-                            # Define timings directly here or import from config/constants
-                            timings = {
-                                "0": "8:15AM-9:45AM",
-                                "1": "10:00AM-11:30AM",
-                                "2": "11:45AM-1:15PM",
-                                "3": "1:45PM-3:15PM",
-                                "4": "3:45PM-5:15PM",
-                            }
                             data_to_cache = (filtered, timings)  # Store as tuple
                     except Exception as e_filter:
                         logger.error(
