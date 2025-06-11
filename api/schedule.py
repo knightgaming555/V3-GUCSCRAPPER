@@ -106,20 +106,14 @@ def api_schedule():
         if cached_data:
             # Validate cached data structure (should be a list/tuple of length 2)
             if isinstance(cached_data, (list, tuple)) and len(cached_data) == 2:
-                # Check if it's a schedule update message (Monday with "Schedule is being updated")
-                schedule_data = cached_data[0]
-                if (isinstance(schedule_data, dict) and
-                    "Monday" in schedule_data and
-                    isinstance(schedule_data["Monday"], dict) and
-                    "First Period" in schedule_data["Monday"] and
-                    isinstance(schedule_data["Monday"]["First Period"], dict) and
-                    schedule_data["Monday"]["First Period"].get("Course_Name") == "Schedule is being updated"):
-                    logger.info(f"Serving schedule update message from cache for {username}")
+                # Check if it's an empty schedule (first element is empty dict)
+                if isinstance(cached_data[0], dict) and len(cached_data[0]) == 0:
+                    logger.info(f"Serving empty schedule from cache for {username}")
                     g.log_outcome = "cache_hit_empty_schedule"
                 else:
                     logger.info(f"Serving schedule from cache for {username}")
                     g.log_outcome = "cache_hit"
-                # Return the cached tuple directly (whether update message or full schedule)
+                # Return the cached tuple directly (whether empty or full)
                 return jsonify(cached_data), 200
             else:
                 logger.warning(
@@ -193,26 +187,17 @@ def api_schedule():
 
             # Check if the schedule is empty (no meaningful course data)
             if is_schedule_empty(filtered_data):
-                logger.info(f"Schedule for {username} contains no meaningful course data, returning schedule update message")
+                logger.info(f"Schedule for {username} contains no meaningful course data, returning empty schedule with timings")
                 g.log_outcome = "scrape_success_empty_schedule"
 
-                # Prepare schedule update message response
-                schedule_update_message = {
-                    "Monday": {
-                        "First Period": {
-                            "Course_Name": "Schedule is being updated",
-                            "Location": "No location",
-                            "Type": "No Type"
-                        }
-                    }
-                }
-                empty_schedule_response = (schedule_update_message, TIMINGS)
+                # Prepare empty schedule response (empty schedule object with timings)
+                empty_schedule_response = ({}, TIMINGS)
 
                 # Cache the empty result
                 set_in_cache(
                     cache_key, empty_schedule_response, timeout=config.CACHE_LONG_TIMEOUT
-                )  # Cache schedule update message
-                logger.info(f"Cached schedule update message for {username}")
+                )  # Cache empty schedule with timings
+                logger.info(f"Cached empty schedule for {username}")
 
                 return jsonify(empty_schedule_response), 200
 
