@@ -56,7 +56,6 @@ try:
         scrape_course_content,
         scrape_course_announcements,
     )
-    from api.schedule import is_schedule_empty
 except ImportError as e:
     print(f"Error importing scraping functions: {e}.", file=sys.stderr)
     sys.exit(1)
@@ -612,7 +611,6 @@ async def run_refresh_for_user(username, password, data_types_to_run, refreshed_
                 if data_type == "schedule":
                     try:
                         filtered = filter_schedule_details(final_data)
-
                         # Define timings directly here or import from config/constants
                         timings = {
                             "0": "8:15AM-9:45AM",
@@ -621,23 +619,7 @@ async def run_refresh_for_user(username, password, data_types_to_run, refreshed_
                             "3": "1:45PM-3:15PM",
                             "4": "3:45PM-5:15PM",
                         }
-
-                        # Check if the schedule is empty (no meaningful course data)
-                        if is_schedule_empty(filtered):
-                            logger.info(f"Schedule for {username} contains no meaningful course data, caching schedule update message")
-                            # Prepare schedule update message
-                            schedule_update_message = {
-                                "Monday": {
-                                    "First Period": {
-                                        "Course_Name": "Schedule is being updated",
-                                        "Location": "No location",
-                                        "Type": "No Type"
-                                    }
-                                }
-                            }
-                            data_to_cache = (schedule_update_message, timings)  # Store update message with timings
-                        else:
-                            data_to_cache = (filtered, timings)  # Store as tuple
+                        data_to_cache = (filtered, timings)  # Store as tuple
                     except Exception as e_filter:
                         logger.error(
                             f"Failed to filter schedule data for {task_name}: {e_filter}"
