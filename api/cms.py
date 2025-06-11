@@ -40,6 +40,44 @@ CMS_COURSE_DATA_CACHE_PREFIX = "cms_content"
 CMS_NOTIFICATIONS_CACHE_PREFIX = "cms_notifications"
 
 
+def _is_cms_content_substantial(content_data: list) -> bool:
+    """
+    Evaluates if CMS content data is substantial (has real content weeks with materials).
+
+    Args:
+        content_data: List containing announcements, mock weeks, and actual content weeks
+
+    Returns:
+        bool: True if content has substantial material beyond just announcements/mock data
+    """
+    if not content_data or not isinstance(content_data, list):
+        return False
+
+    # Count actual content weeks (not announcements or mock weeks)
+    actual_content_weeks = 0
+    total_materials = 0
+
+    for item in content_data:
+        if isinstance(item, dict):
+            # Skip announcements
+            if "course_announcement" in item:
+                continue
+
+            # Check if this is a week with actual content
+            if "week_title" in item and "week_content" in item:
+                week_content = item.get("week_content", [])
+                if isinstance(week_content, list) and len(week_content) > 0:
+                    # Check if it's not just a mock week
+                    week_title = item.get("week_title", "").lower()
+                    if "mock" not in week_title and "placeholder" not in week_title:
+                        actual_content_weeks += 1
+                        total_materials += len(week_content)
+
+    # Consider content substantial if it has at least 1 real week with materials
+    # or at least 3 total materials across weeks
+    return actual_content_weeks >= 1 or total_materials >= 3
+
+
 # --- Helper to get combined course data (content + announcement) ---
 def get_combined_course_data(
     username: str, password: str, course_url: str, force_refresh: bool = False
@@ -171,14 +209,45 @@ def get_combined_course_data(
             f"scrape_course_content returned unexpected type: {type(content_list)}"
         )
 
-    # 4. Cache the result
+    # 4. Cache the result with fallback logic
+    new_data_is_substantial = _is_cms_content_substantial(combined_data_for_cache)
+
     if course_announcement_dict_to_add or (
         content_list is not None and isinstance(content_list, list)
     ):
+        # If new data is not substantial, check if we should preserve existing cache
+        if not new_data_is_substantial:
+            logger.warning(
+                f"Newly fetched CMS content for {normalized_url} is not substantial (empty/minimal content)"
+            )
+
+            # Try to get existing cached data
+            existing_cached_data = get_pickle_cache(cache_key)
+            existing_data_is_substantial = _is_cms_content_substantial(existing_cached_data)
+
+            if existing_cached_data and existing_data_is_substantial:
+                logger.info(
+                    f"Preserving existing substantial CMS content cache for {normalized_url} "
+                    f"instead of overwriting with insufficient new data (Key: {cache_key})"
+                )
+                # Extend the timeout of existing cache to keep it fresh
+                if set_pickle_cache(cache_key, existing_cached_data, timeout=config.CACHE_LONG_CMS_CONTENT_TIMEOUT):
+                    logger.info(f"Successfully preserved and refreshed existing CMS content cache for {cache_key}")
+                    return existing_cached_data
+                else:
+                    logger.error(f"Failed to refresh existing CMS content cache timeout for {cache_key}")
+                    # Fall through to cache new data anyway
+            else:
+                logger.info(f"No existing substantial cache found for {cache_key}, will cache new data even if minimal")
+
+        # Cache the new data (either it's substantial, or no good existing cache exists)
         set_pickle_cache(
             cache_key, combined_data_for_cache, timeout=config.CACHE_LONG_CMS_CONTENT_TIMEOUT
         )
-        logger.info(f"Cached fresh combined CMS data (pickled) for {cache_key}")
+        if new_data_is_substantial:
+            logger.info(f"Cached fresh substantial combined CMS data (pickled) for {cache_key}")
+        else:
+            logger.info(f"Cached fresh minimal combined CMS data (pickled) for {cache_key}")
     else:
         logger.warning(f"Skipping cache set for {cache_key} - only Mock Week resulted.")
 
