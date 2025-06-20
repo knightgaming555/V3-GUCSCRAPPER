@@ -1,11 +1,10 @@
 # utils/cache.py
 import redis
-import orjson # Use orjson for faster JSON operations
+import json
 import logging
 import base64  # For simple binary caching
 import time
 import pickle
-import hashlib # Added for hashing
 
 from config import config  # Import the singleton instance
 
@@ -15,8 +14,8 @@ redis_client = None
 try:
     # Initialize Redis client - decode_responses=False for binary/pickle/base64
     redis_client = redis.from_url(
-        config.REDIS_URL, decode_responses=False, socket_timeout=10, health_check_interval=30
-    )
+        config.REDIS_URL, decode_responses=False, socket_timeout=10
+    )  # Keep a reasonable timeout
     redis_client.ping()
     logger.info(f"Utils/Cache: Successfully connected to Redis at {config.REDIS_URL}")
 except redis.exceptions.ConnectionError as e:
@@ -36,14 +35,17 @@ def get_from_cache(key: str):
         logger.warning("Redis client not available, cannot get from cache.")
         return None
     try:
-        cached_bytes = redis_client.get(key.encode("utf-8"))
+        cached_bytes = redis_client.get(key.encode("utf-8"))  # GET expects bytes key
         if cached_bytes:
             try:
-                return orjson.loads(cached_bytes)
-            except orjson.JSONDecodeError as e:
+                # Assume cached data is JSON encoded UTF-8 string
+                return json.loads(cached_bytes.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 logger.error(
                     f"[Cache] Error decoding JSON for key '{key}': {e}. Data: {cached_bytes[:100]!r}"
                 )
+                # Optionally delete corrupted key
+                # delete_from_cache(key)
                 return None
         return None
     except redis.exceptions.ConnectionError as e:
@@ -59,20 +61,21 @@ def set_in_cache(key: str, value, timeout: int = config.CACHE_DEFAULT_TIMEOUT):
         logger.warning("Redis client not available, cannot set cache.")
         return False
     try:
-        # Use orjson.dumps with OPT_SORT_KEYS for consistency if value is a dict/contains dicts
-        value_bytes = orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
+        value_json = json.dumps(value, ensure_ascii=False)
+        value_bytes = value_json.encode("utf-8")
+        # SETEX expects bytes key and value
         redis_client.setex(key.encode("utf-8"), timeout, value_bytes)
-        logger.debug(f"Set cache for key '{key}' (direct) with timeout {timeout}s")
+        logger.debug(f"Set cache for key '{key}' with timeout {timeout}s")
         return True
     except redis.exceptions.ConnectionError as e:
-        logger.error(f"[Cache] Redis connection error on set '{key}' (direct): {e}")
+        logger.error(f"[Cache] Redis connection error on set '{key}': {e}")
     except TypeError as e:
         logger.error(
-            f"[Cache] Failed to serialize value to JSON for key '{key}' (direct): {e}",
+            f"[Cache] Failed to serialize value to JSON for key '{key}': {e}",
             exc_info=True,
         )
     except Exception as e:
-        logger.error(f"[Cache] Error setting key '{key}' (direct): {e}", exc_info=True)
+        logger.error(f"[Cache] Error setting key '{key}': {e}", exc_info=True)
     return False
 
 
@@ -82,6 +85,7 @@ def delete_from_cache(key: str) -> int:
         logger.warning("Redis client not available, cannot delete from cache.")
         return 0
     try:
+        # Use byte key directly since client has decode_responses=False
         deleted_count = redis_client.delete(key.encode("utf-8"))
         if deleted_count > 0:
             logger.info(f"Deleted cache key: {key}")
@@ -94,16 +98,88 @@ def delete_from_cache(key: str) -> int:
 
 
 def generate_cache_key(prefix: str, username: str, identifier: str = None) -> str:
-    """Generates a consistent cache key. Used by refresh_cache for key_base."""
+    """Generates a consistent cache key."""
     if identifier:
+        import hashlib
+
+        # Ensure identifier is string before encoding
         id_str = str(identifier)
-        # Using hashlib directly here as it's for key name generation, not data hashing
-        import hashlib as local_hash_for_key_gen
-        hash_part = local_hash_for_key_gen.md5(id_str.encode("utf-8")).hexdigest()[:16]
+        hash_part = hashlib.md5(id_str.encode("utf-8")).hexdigest()[:16]
         key = f"{prefix}:{username}:{hash_part}"
     else:
         key = f"{prefix}:{username}"
+    # Basic cleanup - replace common URL chars if needed, though Redis keys are quite flexible
+    # key = key.replace('://', '_').replace('/', '_').replace('?', '_').replace('&', '_').replace('=', '_')
     return key
+
+
+# --- Simple Binary Caching (Base64 encoded string stored with SETEX) ---
+
+
+def save_binary_simple(
+    cache_key: str, content: bytes, expiry: int = config.PROXY_CACHE_EXPIRY
+):
+    """Saves binary content to Redis as a Base64 encoded string using SETEX."""
+    if not redis_client:
+        logger.warning("Redis client not available, cannot save binary cache (simple).")
+        return False
+    try:
+        start_time = time.perf_counter()
+        encoded_content_bytes = base64.b64encode(content)  # Get bytes
+        # SETEX expects bytes for the value when decode_responses=False
+        redis_client.setex(cache_key.encode("utf-8"), expiry, encoded_content_bytes)
+        duration = time.perf_counter() - start_time
+        logger.info(
+            f"Saved binary content (simple Base64 SETEX) for {cache_key} ({len(content)} bytes -> {len(encoded_content_bytes)} encoded bytes) in {duration:.3f}s"
+        )
+        return True
+    except redis.exceptions.TimeoutError:
+        logger.error(
+            f"Redis TIMEOUT error saving binary cache (simple) for {cache_key}."
+        )
+    except redis.exceptions.ConnectionError as e:
+        logger.error(
+            f"Redis connection error saving binary cache (simple) for {cache_key}: {e}"
+        )
+    except Exception as e:
+        logger.error(
+            f"Error saving binary cache (simple) for {cache_key}: {e}", exc_info=True
+        )
+    return False
+
+
+def get_binary_simple(cache_key: str) -> bytes | None:
+    """Gets binary content stored as a Base64 string from Redis."""
+    if not redis_client:
+        logger.warning("Redis client not available, cannot get binary cache (simple).")
+        return None
+    try:
+        # GET returns bytes since decode_responses=False
+        encoded_content_bytes = redis_client.get(cache_key.encode("utf-8"))
+        if encoded_content_bytes:
+            try:
+                decoded_bytes = base64.b64decode(encoded_content_bytes)
+                logger.info(
+                    f"Retrieved binary content (simple Base64) for {cache_key} ({len(decoded_bytes)} bytes)"
+                )
+                return decoded_bytes
+            except Exception as decode_err:
+                logger.error(
+                    f"Error decoding base64 cache (simple) for {cache_key}: {decode_err}"
+                )
+                # Optionally delete corrupted key
+                # delete_from_cache(cache_key)
+                return None
+        return None
+    except redis.exceptions.ConnectionError as e:
+        logger.error(
+            f"Redis connection error reading binary cache (simple) for {cache_key}: {e}"
+        )
+    except Exception as e:
+        logger.error(
+            f"Error reading binary cache (simple) for {cache_key}: {e}", exc_info=True
+        )
+    return None
 
 
 def get_pickle_cache(key: str):
@@ -120,8 +196,10 @@ def get_pickle_cache(key: str):
                 logger.error(
                     f"[Cache] Error unpickling data for key '{key}': {e}. Data: {cached_bytes[:100]!r}"
                 )
+                # Optionally delete corrupted key
+                # delete_from_cache(key)
                 return None
-            except Exception as e_unpickle:
+            except Exception as e_unpickle: # Catch other potential unpickling issues
                 logger.error(f"[Cache] General error unpickling key '{key}': {e_unpickle}", exc_info=True)
                 return None
         return None
@@ -139,12 +217,13 @@ def set_pickle_cache(key: str, value, timeout: int = config.CACHE_DEFAULT_TIMEOU
         return False
     try:
         pickled_value = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        # redis_client is initialized with decode_responses=False, so it expects bytes for key and value with setex
         redis_client.setex(key.encode("utf-8"), timeout, pickled_value)
         logger.info(f"Set PICKLE cache for key {key} with expiry {timeout} seconds")
         return True
     except redis.exceptions.ConnectionError as e:
         logger.error(f"Pickle Cache: Redis connection error on set '{key}': {e}")
-    except (pickle.PicklingError, TypeError) as e:
+    except (pickle.PicklingError, TypeError) as e: # Catch errors during pickling
         logger.error(
             f"Pickle Cache: Error pickling value for key '{key}': {e}",
             exc_info=True,
@@ -152,121 +231,3 @@ def set_pickle_cache(key: str, value, timeout: int = config.CACHE_DEFAULT_TIMEOU
     except Exception as e:
         logger.error(f"Pickle Cache: Error setting key {key}: {e}", exc_info=True)
     return False
-
-
-def save_binary_simple(
-    cache_key: str, content: bytes, expiry: int = config.PROXY_CACHE_EXPIRY
-):
-    if not redis_client: return False
-    try:
-        encoded_content_bytes = base64.b64encode(content)
-        redis_client.setex(cache_key.encode("utf-8"), expiry, encoded_content_bytes)
-        return True
-    except Exception as e:
-        logger.error(f"Error saving binary cache (simple) for {cache_key}: {e}", exc_info=True)
-    return False
-
-def get_binary_simple(cache_key: str) -> bytes | None:
-    if not redis_client: return None
-    try:
-        encoded_content_bytes = redis_client.get(cache_key.encode("utf-8"))
-        if encoded_content_bytes:
-            return base64.b64decode(encoded_content_bytes)
-        return None
-    except Exception as e:
-        logger.error(f"Error reading binary cache (simple) for {cache_key}: {e}", exc_info=True)
-    return None
-
-
-# --- NEW HASH-BASED CACHING FUNCTIONS ---
-
-def _get_canonical_bytes_for_hashing(data_obj, is_pickle: bool):
-    """
-    Converts data to canonical bytes for consistent hashing.
-    For JSON, uses orjson. For Pickle, uses pickle.dumps.
-    """
-    if is_pickle:
-        return pickle.dumps(data_obj, protocol=pickle.HIGHEST_PROTOCOL)
-    else: # JSON
-        return orjson.dumps(data_obj, option=orjson.OPT_SORT_KEYS)
-
-def _generate_data_hash(data_bytes: bytes) -> str:
-    """Generates a SHA256 hash string from bytes."""
-    return hashlib.sha256(data_bytes).hexdigest()
-
-def get_data_and_stored_hash(key_base: str, is_pickle: bool):
-    """
-    Retrieves data object and its stored hash from Redis.
-    '<key_base>:data' stores the actual data (JSON string bytes or pickled bytes).
-    '<key_base>:hash' stores the SHA256 hash string of the data (as bytes).
-    Returns (data_object, stored_hash_string) or (None, None) or (None, stored_hash_string)
-    """
-    if not redis_client:
-        logger.warning("Redis client not available for get_data_and_stored_hash.")
-        return None, None
-
-    data_key_bytes = f"{key_base}:data".encode("utf-8")
-    hash_key_bytes = f"{key_base}:hash".encode("utf-8")
-
-    try:
-        cached_data_bytes = redis_client.get(data_key_bytes)
-        stored_hash_bytes = redis_client.get(hash_key_bytes)
-
-        data_object = None
-        if cached_data_bytes:
-            try:
-                if is_pickle:
-                    data_object = pickle.loads(cached_data_bytes)
-                else: # JSON
-                    data_object = orjson.loads(cached_data_bytes)
-            except (orjson.JSONDecodeError, pickle.UnpicklingError, TypeError) as e:
-                logger.error(f"Error deserializing data for key_base '{key_base}': {e}. Data bytes: {cached_data_bytes[:100]!r}")
-                return None, (stored_hash_bytes.decode("utf-8") if stored_hash_bytes else None)
-
-        stored_hash_string = stored_hash_bytes.decode("utf-8") if stored_hash_bytes else None
-        return data_object, stored_hash_string
-
-    except redis.exceptions.ConnectionError as e:
-        logger.error(f"Redis connection error on get_data_and_stored_hash for '{key_base}': {e}")
-    except Exception as e:
-        logger.error(f"Error in get_data_and_stored_hash for '{key_base}': {e}", exc_info=True)
-    return None, None
-
-
-def set_data_and_hash_pipelined(pipe, key_base: str, data_obj, new_hash_string: str, canonical_data_bytes: bytes, timeout: int, is_pickle: bool):
-    """
-    Adds commands to set data and its hash to a Redis pipeline.
-    `canonical_data_bytes` are the bytes generated by _get_canonical_bytes_for_hashing.
-    `new_hash_string` is the hash generated from `canonical_data_bytes`.
-    """
-    if not redis_client:
-        logger.error("Redis client not available for pipelined set.")
-        return
-
-    data_key_bytes = f"{key_base}:data".encode("utf-8")
-    hash_key_bytes = f"{key_base}:hash".encode("utf-8")
-
-    try:
-        pipe.setex(data_key_bytes, timeout, canonical_data_bytes)
-        pipe.setex(hash_key_bytes, timeout, new_hash_string.encode("utf-8"))
-        logger.debug(f"Pipelined SETEX for {key_base}:data and {key_base}:hash with timeout {timeout}s")
-    except Exception as e:
-        logger.error(f"Error adding set_data_and_hash to pipeline for '{key_base}': {e}", exc_info=True)
-        raise
-
-
-def expire_keys_pipelined(pipe, key_base: str, timeout: int):
-    """Adds commands to EXPIRE data and hash keys to a Redis pipeline."""
-    if not redis_client:
-        logger.error("Redis client not available for pipelined expire.")
-        return
-
-    data_key_bytes = f"{key_base}:data".encode("utf-8")
-    hash_key_bytes = f"{key_base}:hash".encode("utf-8")
-    try:
-        pipe.expire(data_key_bytes, timeout)
-        pipe.expire(hash_key_bytes, timeout)
-        logger.debug(f"Pipelined EXPIRE for {key_base}:data and {key_base}:hash with timeout {timeout}s")
-    except Exception as e:
-        logger.error(f"Error adding expire_keys to pipeline for '{key_base}': {e}", exc_info=True)
-        raise
