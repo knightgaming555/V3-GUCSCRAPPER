@@ -4,6 +4,7 @@ import json
 from flask import Blueprint, request, jsonify, g
 import concurrent.futures  # To run scraping tasks
 import hashlib  # Added for hash generation
+import time # Added for timing logs
 
 from config import config
 from scraping.core import create_session, make_request
@@ -18,7 +19,7 @@ from utils.cache import (
     get_pickle_cache,
     set_pickle_cache
 )
-from utils.helpers import normalize_course_url
+from utils.helpers import normalize_course_url, get_from_memory_cache, set_in_memory_cache # Import in-memory cache functions
 
 # Import specific scraping functions needed
 from scraping.cms import (
@@ -35,9 +36,12 @@ logger = logging.getLogger(__name__)
 cms_bp = Blueprint("cms_bp", __name__)
 
 # --- Constants ---
-CMS_COURSES_CACHE_PREFIX = "cms"
+CMS_COURSES_CACHE_PREFIX = "cms_courses"
 CMS_COURSE_DATA_CACHE_PREFIX = "cms_content"
 CMS_NOTIFICATIONS_CACHE_PREFIX = "cms_notifications"
+
+# Define a short TTL for in-memory cache for hot CMS content data
+CMS_CONTENT_MEMORY_CACHE_TTL = 30 # seconds
 
 
 def _is_cms_content_substantial(content_data: list) -> bool:
@@ -103,9 +107,9 @@ def get_combined_course_data(
 
     # Generate cache key consistent with refresh_cache.py for cms_content
     # Key format: "cms_content:{hash_of_username_and_normalized_url}"
-    key_string_for_hash = f"{username}:{normalized_url}"
-    hash_value = hashlib.md5(key_string_for_hash.encode("utf-8")).hexdigest()
-    cache_key = f"{CMS_COURSE_DATA_CACHE_PREFIX}:{hash_value}"
+    # key_string_for_hash = f"{username}:{normalized_url}" # Original, now global
+    # hash_value = hashlib.md5(key_string_for_hash.encode("utf-8")).hexdigest()
+    # cache_key = f"{CMS_COURSE_DATA_CACHE_PREFIX}:{hash_value}"
 
     # NEW global cache key generation (matching refresh_cache.py's modified generate_cms_content_cache_key logic):
     if not normalized_url:
@@ -117,31 +121,56 @@ def get_combined_course_data(
     cache_key = f"{CMS_COURSE_DATA_CACHE_PREFIX}:{global_hash_value}"
     logger.debug(f"Using global cache key for {normalized_url}: {cache_key}")
 
-    # 1. Check Cache (only if force_refresh is False)
+    # --- Cache Check (In-Memory first, then Redis) ---
     if not force_refresh:
-        # Use get_pickle_cache for cms_content as it's stored pickled
-        cached_data = get_pickle_cache(cache_key)
+        # 1. Check in-memory cache
+        in_memory_cache_check_start_time = time.perf_counter()
+        cached_data = get_from_memory_cache(cache_key)
+        in_memory_cache_check_duration = (time.perf_counter() - in_memory_cache_check_start_time) * 1000
+        logger.info(f"TIMING: In-memory Cache check for CMS content took {in_memory_cache_check_duration:.2f} ms")
+
         if cached_data:
-            # Basic validation of cached structure
             if isinstance(cached_data, list) and len(cached_data) > 0:
                 logger.info(
-                    f"Serving combined CMS data from cache for {username} - {normalized_url}"
+                    f"Serving combined CMS data from IN-MEMORY cache for {username} - {normalized_url}"
                 )
                 return cached_data
             else:
                 logger.warning(
-                    f"Invalid combined CMS data found in cache for {cache_key}. Fetching fresh."
+                    f"Invalid combined CMS data format found in IN-MEMORY cache for {cache_key}. Fetching fresh."
+                )
+
+        # 2. If not in-memory, check Redis cache
+        redis_cache_check_start_time = time.perf_counter()
+        cached_data = get_pickle_cache(cache_key)
+        redis_cache_check_duration = (time.perf_counter() - redis_cache_check_start_time) * 1000
+        logger.info(f"TIMING: Redis Cache check for CMS content took {redis_cache_check_duration:.2f} ms")
+
+        if cached_data:
+            # Basic validation of cached structure
+            if isinstance(cached_data, list) and len(cached_data) > 0:
+                logger.info(
+                    f"Serving combined CMS data from REDIS cache for {username} - {normalized_url}"
+                )
+                # Set in in-memory cache for future rapid access
+                set_in_memory_cache(cache_key, cached_data, ttl=CMS_CONTENT_MEMORY_CACHE_TTL)
+                logger.info(f"Set CMS content in IN-MEMORY cache for {username}")
+                return cached_data
+            else:
+                logger.warning(
+                    f"Invalid combined CMS data format found in REDIS cache for {cache_key}. Fetching fresh."
                 )
     else:
         logger.info(
-            f"Force refresh requested for combined CMS data for {username} - {normalized_url}"
+            f"Force refresh requested for combined CMS data for {username} - {normalized_url}. Bypassing all caches."
         )
 
-    # 2. Cache Miss or Forced Refresh -> Fetch Fresh Data Concurrently
-    log_prefix = "Cache miss" if not force_refresh else "Forced refresh"
+    # 3. Cache Miss or Forced Refresh -> Fetch Fresh Data Concurrently
+    log_prefix = "Cache miss (both in-memory and Redis)" if not force_refresh else "Forced refresh"
     logger.info(
         f"{log_prefix} for combined CMS data. Fetching fresh for {username} - {normalized_url}"
     )
+    scrape_call_start_time = time.perf_counter()
 
     content_list = None
     announcement_result = (
@@ -171,13 +200,16 @@ def get_combined_course_data(
         except Exception as e:
             logger.error(f"Course announcement future error: {e}")
 
+    scrape_call_duration = (time.perf_counter() - scrape_call_start_time) * 1000
+    logger.info(f"TIMING: CMS content scrape took {scrape_call_duration:.2f} ms")
+
     if not fetch_success:
         logger.error(
             f"Both content and announcement fetch failed for course: {normalized_url}"
         )
         return {"error": "Failed to fetch data for the specified course."}
 
-    # 3. Assemble final list for caching and returning
+    # 4. Assemble final list for caching and returning
 
     combined_data_for_cache = []
     course_announcement_dict_to_add = None
@@ -210,7 +242,7 @@ def get_combined_course_data(
             f"scrape_course_content returned unexpected type: {type(content_list)}"
         )
 
-    # 4. Cache the result with fallback logic
+    # 5. Cache the result with fallback logic
     new_data_is_substantial = _is_cms_content_substantial(combined_data_for_cache)
 
     if course_announcement_dict_to_add or (
@@ -222,54 +254,66 @@ def get_combined_course_data(
                 f"Newly fetched CMS content for {normalized_url} is not substantial (empty/minimal content)"
             )
 
-            # Try to get existing cached data
+            # Try to get existing cached data from Redis
             existing_cached_data = get_pickle_cache(cache_key)
             existing_data_is_substantial = _is_cms_content_substantial(existing_cached_data)
 
             if existing_cached_data and existing_data_is_substantial:
                 logger.info(
-                    f"Preserving existing substantial CMS content cache for {normalized_url} "
+                    f"Preserving existing substantial CMS content cache (REDIS) for {normalized_url} "
                     f"instead of overwriting with insufficient new data (Key: {cache_key})"
                 )
-                # Extend the timeout of existing cache to keep it fresh
+                # Extend the timeout of existing cache to keep it fresh in Redis
                 if set_pickle_cache(cache_key, existing_cached_data, timeout=config.CACHE_LONG_CMS_CONTENT_TIMEOUT):
-                    logger.info(f"Successfully preserved and refreshed existing CMS content cache for {cache_key}")
+                    logger.info(f"Successfully preserved and refreshed existing CMS content cache (REDIS) for {cache_key}")
+                    # Also set in in-memory cache if preserving
+                    set_in_memory_cache(cache_key, existing_cached_data, ttl=CMS_CONTENT_MEMORY_CACHE_TTL)
+                    logger.info(f"Set preserved CMS content in IN-MEMORY cache for {cache_key}")
                     return existing_cached_data
                 else:
-                    logger.error(f"Failed to refresh existing CMS content cache timeout for {cache_key}")
+                    logger.error(f"Failed to refresh existing CMS content cache (REDIS) timeout for {cache_key}")
                     # Fall through to cache new data anyway
             else:
-                logger.info(f"No existing substantial cache found for {cache_key}, will cache new data even if minimal")
+                logger.info(f"No existing substantial cache (REDIS) found for {cache_key}, will cache new data even if minimal")
 
-        # Cache the new data (either it's substantial, or no good existing cache exists)
+        # Cache the new data in Redis (either it's substantial, or no good existing cache exists)
         set_pickle_cache(
             cache_key, combined_data_for_cache, timeout=config.CACHE_LONG_CMS_CONTENT_TIMEOUT
         )
         if new_data_is_substantial:
-            logger.info(f"Cached fresh substantial combined CMS data (pickled) for {cache_key}")
+            logger.info(f"Cached fresh substantial combined CMS data (pickled) in REDIS for {cache_key}")
         else:
-            logger.info(f"Cached fresh minimal combined CMS data (pickled) for {cache_key}")
-    else:
-        logger.warning(f"Skipping cache set for {cache_key} - only Mock Week resulted.")
+            logger.info(f"Cached new minimal combined CMS data (pickled) in REDIS for {cache_key}")
+
+        # Also cache the new data in in-memory
+        set_in_memory_cache(cache_key, combined_data_for_cache, ttl=CMS_CONTENT_MEMORY_CACHE_TTL)
+        logger.info(f"Cached fresh combined CMS data in IN-MEMORY for {cache_key}")
 
     return combined_data_for_cache
 
 
-# --- API Endpoints ---
-
-
-# /cms_data endpoint remains the same, only fetches course list
 @cms_bp.route("/cms_data", methods=["GET"])
 def api_cms_courses():
-    """Endpoint to fetch the list of courses from CMS homepage."""
+    """
+    Endpoint to fetch the user's CMS courses.
+    Uses cache first, then scrapes if needed.
+    Requires query params: username, password.
+    """
+    req_start_time = time.perf_counter() # Overall request start
+
     if request.args.get("bot", "").lower() == "true":
         logger.info("Received bot health check request for CMS Courses API.")
         g.log_outcome = "bot_check_success"
-        return jsonify({
-            "status": "Success",
-            "message": "CMS Courses API route is up!",
-            "data": None,
-        }), 200
+        return (
+            jsonify(
+                {
+                    "status": "Success",
+                    "message": "CMS Courses API route is up!",
+                    "data": None,
+                }
+            ),
+            200,
+        )
 
     username = request.args.get("username")
     password = request.args.get("password")
@@ -277,56 +321,89 @@ def api_cms_courses():
     g.username = username
 
     if username == "google.user" and password == "google@3569":
-        logger.info(f"Serving mock cms data for user {username}")
+        logger.info(f"Serving mock cms_courses data for user {username}")
         g.log_outcome = "mock_data_served"
-        return jsonify(cmsdata_mockData), 200
+        return jsonify(cmsdata_mockData["courses"]), 200
 
     try:
-        if not username or not password:
-            g.log_outcome = "validation_error_cms_courses"
-            g.log_error_message = "Missing required parameters (username, password) for CMS Courses"
-            return jsonify({
-                "status": "error",
-                "message": "Missing required parameters: username, password"
-            }), 400
-
         password_to_use = get_password_for_readonly_session(username, password)
 
+        # --- Cache Check (In-Memory first, then Redis) ---
         cache_key = generate_cache_key(CMS_COURSES_CACHE_PREFIX, username)
         if not force_refresh:
-            cached_data = get_from_cache(cache_key)
-            if (
-                cached_data is not None
-            ):  # Check explicitly for None, allow empty list from cache
-                logger.info(f"Serving CMS courses from cache for {username}")
-                g.log_outcome = "cache_hit"
+            # 1. Check in-memory cache
+            in_memory_cache_check_start_time = time.perf_counter()
+            cached_data = get_from_memory_cache(cache_key)
+            in_memory_cache_check_duration = (time.perf_counter() - in_memory_cache_check_start_time) * 1000
+            logger.info(f"TIMING: In-memory Cache check for CMS courses took {in_memory_cache_check_duration:.2f} ms")
+
+            if cached_data is not None:  # Allow empty list [] from cache
+                logger.info(f"Serving CMS courses from IN-MEMORY cache for {username}")
+                g.log_outcome = "memory_cache_hit"
                 return jsonify(cached_data), 200
 
-        # --- Scrape ---
-        logger.info(
-            f"Cache miss or forced refresh for CMS courses. Scraping for {username}"
-        )
-        g.log_outcome = "scrape_attempt"
-        courses = scrape_cms_courses(username, password_to_use)
+            # 2. If not in-memory, check Redis cache
+            redis_cache_check_start_time = time.perf_counter()
+            cached_data = get_from_cache(cache_key)
+            redis_cache_check_duration = (time.perf_counter() - redis_cache_check_start_time) * 1000
+            logger.info(f"TIMING: Redis Cache check for CMS courses took {redis_cache_check_duration:.2f} ms")
 
-        if courses is None:  # Indicates scraping failure
-            g.log_outcome = (
-                "scrape_error"  # More specific outcome set by scraper usually
-            )
-            g.log_error_message = "Failed to scrape CMS course list"  # Generic message
+            if cached_data is not None:  # Allow empty list [] from cache
+                logger.info(f"Serving CMS courses from REDIS cache for {username}")
+                g.log_outcome = "redis_cache_hit"
+                # Set in in-memory cache for future rapid access
+                set_in_memory_cache(cache_key, cached_data, ttl=CMS_CONTENT_MEMORY_CACHE_TTL)
+                logger.info(f"Set CMS courses in IN-MEMORY cache for {username}")
+                return jsonify(cached_data), 200
+
+        # --- Cache Miss -> Scrape ---
+        logger.info(f"Cache miss or forced refresh for CMS courses (both in-memory and Redis). Scraping for {username}")
+        g.log_outcome = "scrape_attempt"
+        scrape_call_start_time = time.perf_counter()
+
+        courses = scrape_cms_courses(username, password_to_use)
+        scrape_call_duration = (time.perf_counter() - scrape_call_start_time) * 1000
+        logger.info(f"TIMING: CMS courses scrape took {scrape_call_duration:.2f} ms")
+
+        if courses is None:
+            g.log_outcome = "scrape_error"
+            g.log_error_message = "CMS courses scraper returned None"
+            logger.error(f"CMS courses scraping returned None for {username}.")
             return (
                 jsonify(
-                    {"status": "error", "message": "Failed to fetch CMS course list"}
+                    {
+                        "status": "error",
+                        "message": "Failed to fetch CMS courses due to a server error",
+                    }
                 ),
-                502,  # Bad Gateway / Upstream error
+                500,
             )
+        elif isinstance(courses, dict) and "error" in courses:
+            error_msg = courses["error"]
+            logger.error(
+                f"CMS courses scraping returned specific error for {username}: {error_msg}"
+            )
+            g.log_error_message = error_msg
+            if "Authentication failed" in error_msg:
+                g.log_outcome = "scrape_auth_error"
+                status_code = 401
+            else:
+                g.log_outcome = "scrape_returned_error"
+                status_code = 502
+            return jsonify({"status": "error", "message": error_msg}), status_code
         else:
-            # Success (courses can be an empty list [])
-            g.log_outcome = "scrape_success" if courses else "scrape_success_nodata"
+            # --- Success ---
+            g.log_outcome = "scrape_success"
+            logger.info(f"Successfully scraped CMS courses for {username}")
+
+            # Cache the successful result in Redis
             set_in_cache(cache_key, courses, timeout=config.CACHE_LONG_TIMEOUT)
-            logger.info(
-                f"Successfully scraped {len(courses)} CMS courses for {username}"
-            )
+            logger.info(f"Cached fresh CMS courses in REDIS for {username}")
+
+            # Cache the successful result in in-memory
+            set_in_memory_cache(cache_key, courses, ttl=CMS_CONTENT_MEMORY_CACHE_TTL) # Using CMS_CONTENT_MEMORY_CACHE_TTL as a generic default for CMS related items
+            logger.info(f"Cached fresh CMS courses in IN-MEMORY for {username}")
+
             return jsonify(courses), 200
 
     except AuthError as e:
@@ -338,7 +415,7 @@ def api_cms_courses():
         return jsonify({"status": "error", "message": str(e)}), e.status_code
     except Exception as e:
         logger.exception(
-            f"Unhandled exception during /api/cms_courses for {username}: {e}"
+            f"Unhandled exception during /api/cms_data for {username}: {e}"
         )
         g.log_outcome = "internal_error_unhandled"
         g.log_error_message = f"Unhandled exception: {e}"
@@ -353,19 +430,18 @@ def api_cms_courses():
 @cms_bp.route("/cms_content", methods=["GET"])
 def api_cms_content():
     """
-    Endpoint to fetch content AND announcement for a SPECIFIC course.
-    Requires 'course_url' query parameter.
-    Accepts 'force_refresh=true' to bypass cache.
-    Returns the combined list structure: [AnnouncementDict?, MockWeekDict, WeekDict1...]
+    Endpoint to fetch detailed CMS content for a specific course.
+    Requires query params: username, password, course_url.
     """
+    req_start_time = time.perf_counter() # Overall request start
+
     if request.args.get("bot", "").lower() == "true":
         logger.info("Received bot health check request for CMS Content API.")
         g.log_outcome = "bot_check_success"
-        return jsonify({
-            "status": "Success",
-            "message": "CMS Content API route is up!",
-            "data": None,
-        }), 200
+        return (
+            jsonify({"status": "Success", "message": "CMS Content API route is up!"}),
+            200,
+        )
 
     username = request.args.get("username")
     password = request.args.get("password")
@@ -374,174 +450,181 @@ def api_cms_content():
     g.username = username
 
     if username == "google.user" and password == "google@3569":
-        logger.info(f"Handling mock cms content request for user {username}")
-
-        if not course_url:
-            logger.warning("Mock user request missing course_url")
-            g.log_outcome = "mock_validation_error"
-            g.log_error_message = "Missing course_url parameter for mock user"
-            return jsonify({
-                "status": "error",
-                "message": "Missing required parameter: course_url",
-            }), 400
-
-        normalized_requested_url = normalize_course_url(course_url)
-        if not normalized_requested_url:
-            logger.warning(f"Mock user request invalid course_url: {course_url}")
-            g.log_outcome = "mock_validation_error"
-            g.log_error_message = f"Invalid course_url format for mock user: {course_url}"
-            return jsonify({"status": "error", "message": "Invalid course_url format"}), 400
-
-        specific_mock_content = mock_content_map.get(normalized_requested_url)
-        if specific_mock_content is not None:
-            logger.info(f"Serving specific mock content for matching course URL: {course_url}")
-            g.log_outcome = "mock_data_served_specific"
-            return jsonify(specific_mock_content), 200
+        logger.info("Serving mock cms_content data for google.user")
+        g.log_outcome = "mock_data_served"
+        # Mock content map key needs to be normalized just like real URLs
+        mock_course_key = normalize_course_url(course_url)
+        if mock_course_key and mock_course_key in mock_content_map:
+            return jsonify(mock_content_map[mock_course_key]), 200
         else:
-            logger.info(f"No specific mock content for course URL: {course_url}. Returning empty list.")
-            g.log_outcome = "mock_data_served_empty"
-            return jsonify([]), 200
+            logger.warning(f"Mock content not found for course_url: {course_url}")
+            return jsonify({"status": "error", "message": "Mock content not found"}), 404
 
-    if not course_url:
-        g.log_outcome = "validation_error_cms_content"
-        g.log_error_message = "Missing course_url parameter"
-        return jsonify({
-            "status": "error", "message": "Missing required parameter: course_url"
-        }), 400
-        
-    password_to_use = get_password_for_readonly_session(username, password)
+    try:
+        if not username or not password or not course_url:
+            g.log_outcome = "validation_error"
+            g.log_error_message = (
+                "Missing required parameters (username, password, course_url)"
+            )
+            return (
+                jsonify(
+                    {
+                        "status": "error",
+                        "message": "Missing required parameters: username, password, course_url",
+                    }
+                ),
+                400,
+            )
 
-    result_data = get_combined_course_data(
-        username, password_to_use, course_url, force_refresh=force_refresh
-    )
+        password_to_use = get_password_for_readonly_session(username, password)
 
-    # --- Process the result ---
-    if isinstance(result_data, dict) and "error" in result_data:
-        error_msg = result_data["error"]
-        logger.error(
-            f"Failed to get combined CMS data for {username} - {course_url}: {error_msg}"
+        # Use the helper function that now includes 2-tier caching logic
+        content_data = get_combined_course_data(
+            username, password_to_use, course_url, force_refresh
         )
-        g.log_outcome = "scrape_error"
-        g.log_error_message = error_msg
-        status_code = 500
-        if "Authentication" in error_msg:
-            status_code = 401
-        elif "fetch" in error_msg:
-            status_code = 504
-        elif "parse" in error_msg:
-            status_code = 502
-        elif "not found" in error_msg:
-            status_code = 404
-        return jsonify({"status": "error", "message": error_msg}), status_code
-    elif isinstance(result_data, list):
-        g.log_outcome = (
-            "success_force_refresh" if force_refresh else "success"
-        )  # Differentiate log outcome
-        logger.info(
-            f"Successfully served combined CMS data for {username} - {course_url}{' (forced refresh)' if force_refresh else ''}"
+
+        if isinstance(content_data, dict) and "error" in content_data:
+            error_message = content_data["error"]
+            g.log_outcome = "scrape_error"
+            g.log_error_message = error_message
+            logger.error(f"Error fetching combined CMS content: {error_message}")
+            return jsonify({"status": "error", "message": error_message}), 500
+        elif content_data is None:
+            g.log_outcome = "scrape_error"
+            g.log_error_message = "Combined CMS content function returned None"
+            logger.error(f"get_combined_course_data returned None for {username} - {course_url}.")
+            return (
+                jsonify({"status": "error", "message": "Failed to fetch CMS content"}),
+                500,
+            )
+        else:
+            g.log_outcome = "success"
+            logger.info(f"Successfully retrieved combined CMS content for {username} - {course_url}")
+            return jsonify(content_data), 200
+
+    except AuthError as e:
+        logger.warning(
+            f"AuthError during CMS content request for {username}: {e.log_message}"
         )
-        return jsonify(result_data), 200
-    else:
-        logger.error(
-            f"Unexpected return type from get_combined_course_data: {type(result_data)}"
+        g.log_outcome = e.log_outcome
+        g.log_error_message = e.log_message
+        return jsonify({"status": "error", "message": str(e)}), e.status_code
+    except Exception as e:
+        logger.exception(
+            f"Unhandled exception during /api/cms_content for {username}: {e}"
         )
-        g.log_outcome = "internal_error_logic"
-        g.log_error_message = "Unexpected data format from CMS helper"
+        g.log_outcome = "internal_error_unhandled"
+        g.log_error_message = f"Unhandled exception: {e}"
         return (
             jsonify(
-                {
-                    "status": "error",
-                    "message": "Internal server error processing CMS data",
-                }
+                {"status": "error", "message": "An internal server error occurred"}
             ),
             500,
         )
 
 
-# /cms_notifications endpoint remains the same
 @cms_bp.route("/cms_notifications", methods=["GET"])
 def api_cms_notifications():
-    """Endpoint to fetch notifications from the CMS homepage."""
+    """
+    Endpoint to fetch CMS home page notifications.
+    Uses cache first, then scrapes if needed.
+    Requires query params: username, password
+    """
+    req_start_time = time.perf_counter() # Overall request start
+
     if request.args.get("bot", "").lower() == "true":
         logger.info("Received bot health check request for CMS Notifications API.")
         g.log_outcome = "bot_check_success"
-        return jsonify({
-            "status": "Success",
-            "message": "CMS Notifications API route is up!",
-            "data": None,
-        }), 200
+        return (
+            jsonify({"status": "Success", "message": "CMS Notifications API route is up!"}),
+            200,
+        )
 
     username = request.args.get("username")
     password = request.args.get("password")
     force_refresh = request.args.get("force_refresh", "false").lower() == "true"
     g.username = username
 
-    # Add mock user check if needed, for consistency, though not present before
     if username == "google.user" and password == "google@3569":
-        logger.info(f"Serving mock CMS notifications for user {username}")
+        logger.info(f"Serving mock cms_notifications data for user {username}")
         g.log_outcome = "mock_data_served"
-        return jsonify([]), 200 # Assuming mock notifications are an empty list or fetch from mock_data
+        return jsonify(cmsdata_mockData["notifications"]), 200
 
     try:
-        if not username or not password:
-            g.log_outcome = "validation_error_cms_notifications"
-            g.log_error_message = "Missing required parameters (username, password) for CMS Notifications"
-            return jsonify({
-                "status": "error",
-                "message": "Missing required parameters: username, password"
-            }), 400
-
         password_to_use = get_password_for_readonly_session(username, password)
 
+        # --- Cache Check (In-Memory first, then Redis) ---
         cache_key = generate_cache_key(CMS_NOTIFICATIONS_CACHE_PREFIX, username)
         if not force_refresh:
-            cached_data = get_from_cache(cache_key)
-            if cached_data is not None:
-                logger.info(f"Serving CMS notifications from cache for {username}")
-                g.log_outcome = "cache_hit"
+            # 1. Check in-memory cache
+            in_memory_cache_check_start_time = time.perf_counter()
+            cached_data = get_from_memory_cache(cache_key)
+            in_memory_cache_check_duration = (time.perf_counter() - in_memory_cache_check_start_time) * 1000
+            logger.info(f"TIMING: In-memory Cache check for CMS notifications took {in_memory_cache_check_duration:.2f} ms")
+
+            if cached_data is not None:  # Allow empty list [] from cache
+                logger.info(f"Serving CMS notifications from IN-MEMORY cache for {username}")
+                g.log_outcome = "memory_cache_hit"
                 return jsonify(cached_data), 200
 
-        # --- Scrape ---
-        log_prefix = "Cache miss" if not force_refresh else "Forced refresh"
-        logger.info(f"{log_prefix} for CMS notifications. Scraping for {username}")
+            # 2. If not in-memory, check Redis cache
+            redis_cache_check_start_time = time.perf_counter()
+            cached_data = get_from_cache(cache_key)
+            redis_cache_check_duration = (time.perf_counter() - redis_cache_check_start_time) * 1000
+            logger.info(f"TIMING: Redis Cache check for CMS notifications took {redis_cache_check_duration:.2f} ms")
+
+            if cached_data is not None:  # Allow empty list [] from cache
+                logger.info(f"Serving CMS notifications from REDIS cache for {username}")
+                g.log_outcome = "redis_cache_hit"
+                # Set in in-memory cache for future rapid access
+                set_in_memory_cache(cache_key, cached_data, ttl=CMS_CONTENT_MEMORY_CACHE_TTL) # Using CMS_CONTENT_MEMORY_CACHE_TTL as a generic default for CMS related items
+                logger.info(f"Set CMS notifications in IN-MEMORY cache for {username}")
+                return jsonify(cached_data), 200
+
+        # --- Cache Miss -> Scrape ---
+        logger.info(f"Cache miss or forced refresh for CMS notifications (both in-memory and Redis). Scraping for {username}")
         g.log_outcome = "scrape_attempt"
+        scrape_call_start_time = time.perf_counter()
 
-        session = create_session(username, password_to_use)
-        response = make_request(session, config.CMS_HOME_URL)
+        # Scrape notifications from the CMS home page
+        # The scraper returns a list of notification dicts or an error dict
+        notifications_raw = parse_notifications(username, password_to_use)
+        scrape_call_duration = (time.perf_counter() - scrape_call_start_time) * 1000
+        logger.info(f"TIMING: CMS notifications scrape took {scrape_call_duration:.2f} ms")
 
-        notifications = []
-        if response:
-            notifications = parse_notifications(response.text)
-            if notifications is None:
-                g.log_outcome = "scrape_parsing_error"
-                g.log_error_message = "Failed to parse notifications from CMS homepage"
-                return (
-                    jsonify(
-                        {
-                            "status": "error",
-                            "message": "Failed to parse CMS notifications",
-                        }
-                    ),
-                    502,
-                )
-            else:
-                g.log_outcome = (
-                    "scrape_success" if notifications else "scrape_success_nodata"
-                )
-        else:
+        if notifications_raw is None:
             g.log_outcome = "scrape_error"
-            g.log_error_message = "Failed to fetch CMS homepage for notifications"
+            g.log_error_message = "CMS notifications scraper returned None"
+            logger.error(f"CMS notifications scraping returned None for {username}.")
             return (
-                jsonify({"status": "error", "message": "Failed to fetch CMS homepage"}),
-                502,
+                jsonify(
+                    {
+                        "status": "error",
+                        "message": "Failed to fetch CMS notifications due to a server error",
+                    }
+                ),
+                500,
             )
+        elif isinstance(notifications_raw, dict) and "error" in notifications_raw:
+            error_msg = notifications_raw["error"]
+            g.log_outcome = "scrape_error"
+            g.log_error_message = error_msg
+            logger.error(f"CMS notifications scraping failed for {username}: {error_msg}")
+            return jsonify({"status": "error", "message": error_msg}), 500
+        else:
+            # --- Success ---
+            g.log_outcome = "scrape_success"
+            logger.info(f"Successfully scraped CMS notifications for {username}")
 
-        # Cache result
-        set_in_cache(cache_key, notifications, timeout=config.CACHE_DEFAULT_TIMEOUT)
-        logger.info(
-            f"Successfully scraped {len(notifications)} CMS notifications for {username}"
-        )
-        return jsonify(notifications), 200
+            # Cache the successful result in Redis
+            set_in_cache(cache_key, notifications_raw, timeout=config.CACHE_DEFAULT_TIMEOUT)
+            logger.info(f"Cached fresh CMS notifications in REDIS for {username}")
+
+            # Cache the successful result in in-memory
+            set_in_memory_cache(cache_key, notifications_raw, ttl=CMS_CONTENT_MEMORY_CACHE_TTL) # Using CMS_CONTENT_MEMORY_CACHE_TTL as a generic default for CMS related items
+            logger.info(f"Cached fresh CMS notifications in IN-MEMORY for {username}")
+
+            return jsonify(notifications_raw), 200
 
     except AuthError as e:
         logger.warning(
@@ -564,120 +647,40 @@ def api_cms_notifications():
         )
 
 
-# /announcements endpoint remains the same
 @cms_bp.route("/announcements", methods=["GET"])
 def api_announcements():
-    """Fetches announcements for a specific course URL."""
-    if request.args.get("bot", "").lower() == "true":
+    """
+    Endpoint to retrieve the current API version number and developer announcement.
+    This uses memory-cached getters from utils.helpers.
+    """
+    req_start_time = time.perf_counter() # Overall request start
+
+    if request.args.get("bot", "").lower() == "true":  # Bot check
         logger.info("Received bot health check request for Announcements API.")
         g.log_outcome = "bot_check_success"
-        return jsonify({
-            "status": "Success",
-            "message": "Announcements API route is up!",
-            "data": None,
-        }), 200
-
-    username = request.args.get("username")
-    password = request.args.get("password")
-    course_url = request.args.get("course_url")
-    force_refresh = request.args.get("force_refresh", "false").lower() == "true"
-    g.username = username
-
-    # Add mock user check if needed
-    if username == "google.user" and password == "google@3569":
-        logger.info(f"Serving mock announcements for user {username}, course {course_url}")
-        g.log_outcome = "mock_data_served"
-        # Assuming mock announcements might be course-specific or a generic empty response
-        return jsonify({"announcements_html": ""}), 200
-
-    if not course_url:
-        g.log_outcome = "validation_error_announcements"
-        g.log_error_message = "Missing course_url parameter"
-        return jsonify({
-            "status": "error", "message": "Missing required parameter: course_url"
-        }), 400
-        
-    if not username or not password: # Add full param check
-        g.log_outcome = "validation_error_announcements"
-        g.log_error_message = "Missing required parameters (username, password)"
-        return jsonify({
-            "status": "error",
-            "message": "Missing required parameters: username, password"
-        }), 400
-
-    normalized_url = normalize_course_url(course_url)
-    if not normalized_url:
-        g.log_outcome = "validation_error_announcements"
-        g.log_error_message = f"Invalid course_url format: {course_url}"
-        return jsonify({"status": "error", "message": "Invalid course_url format"}), 400
-
-    try:
-        password_to_use = get_password_for_readonly_session(username, password)
-
-        logger.info(f"Fetching announcements for specific course: {username} - {normalized_url}")
-        g.log_outcome = "scrape_attempt"
-
-        announcement_result = scrape_course_announcements(
-            username, password_to_use, normalized_url
-        )
-
-        if announcement_result is None:
-            g.log_outcome = "scrape_error"
-            g.log_error_message = "Failed to fetch course page for announcements"
-            return (
-                jsonify({"status": "error", "message": "Failed to fetch course data"}),
-                502,
-            )
-        elif isinstance(announcement_result, dict) and "error" in announcement_result:
-            error_msg = announcement_result["error"]
-            logger.warning(
-                f"Failed to scrape announcements for {username} - {normalized_url}: {error_msg}"
-            )
-            g.log_outcome = "scrape_fail_no_announce"
-            g.log_error_message = error_msg
-            status_code = 404 if "not found" in error_msg else 500
-            return jsonify(announcement_result), status_code
-        elif (
-            isinstance(announcement_result, dict)
-            and "announcements_html" in announcement_result
-        ):
-            g.log_outcome = "scrape_success"
-            logger.info(
-                f"Successfully scraped announcements for {username} - {normalized_url}"
-            )
-            return jsonify(announcement_result), 200
-        else:
-            logger.error(
-                f"Unexpected result from scrape_course_announcements: {announcement_result}"
-            )
-            g.log_outcome = "internal_error_logic"
-            g.log_error_message = "Unexpected result format from announcement scraper"
-            return (
-                jsonify(
-                    {
-                        "status": "error",
-                        "message": "Internal server error processing announcements",
-                    }
-                ),
-                500,
-            )
-
-    except AuthError as e:
-        logger.warning(
-            f"AuthError during announcements request for {username}: {e.log_message}"
-        )
-        g.log_outcome = e.log_outcome
-        g.log_error_message = e.log_message
-        return jsonify({"status": "error", "message": str(e)}), e.status_code
-    except Exception as e:
-        logger.exception(
-            f"Unhandled exception during /api/announcements for {username}: {e}"
-        )
-        g.log_outcome = "internal_error_unhandled"
-        g.log_error_message = f"Unhandled exception: {e}"
         return (
-            jsonify(
-                {"status": "error", "message": "An internal server error occurred"}
-            ),
-            500,
+            jsonify({"status": "Success", "message": "Announcements API route is up!"}),
+            200,
         )
+
+    # These functions already use in-memory caching internally
+    version_number = get_version_number_cached()
+    dev_announcement = get_dev_announcement_cached()
+
+    if version_number in ["Error Fetching", "Redis Unavailable"]:
+        g.log_outcome = "internal_error_version"
+        g.log_error_message = f"Failed to retrieve API version: {version_number}"
+        return (
+            jsonify({"status": "error", "message": "Could not retrieve API version."}),
+            503,
+        )
+
+    response_data = {
+        "version_number": version_number,
+        "dev_announcement": dev_announcement,
+    }
+
+    g.log_outcome = "success"
+    logger.info("Served announcements and version number.")
+
+    return jsonify(response_data), 200
