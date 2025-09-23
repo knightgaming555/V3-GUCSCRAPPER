@@ -1,22 +1,22 @@
-//name: Prewarm User Cache (Insecure Password Input)
+name: Prewarm User Cache (Insecure Password Input)
 
 on:
   workflow_dispatch:
     inputs:
-      //username:
-        //description: "GUC Username (e.g., firstname.lastname)"
-        //required: true
+      username:
+        description: "GUC Username (e.g., firstname.lastname)"
+        required: true
         type: string
 
       password:
-        //description: "GUC Password (WARNING: Potentially exposed in logs)"
+        description: "GUC Password (WARNING: Potentially exposed in logs)"
         required: true
         type: string
 
 jobs:
   prewarm:
-   //runs-on: ubuntu-latest
-    steps:
+   runs-on: ubuntu-latest
+   steps:
       - name: Checkout repository
         uses: actions/checkout@v3
 
@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - //name: Install prerequisites (Ubuntu)
+      - name: Install prerequisites (Ubuntu)
         run: |
           sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev
 
@@ -37,9 +37,9 @@ jobs:
       - name: Run prewarm script for user
         env:
           # Get username from the workflow input
-          //TARGET_USERNAME: ${{ github.event.inputs.username }}
+          TARGET_USERNAME: ${{ github.event.inputs.username }}
           # !!! Get password DIRECTLY from input - INSECURE !!!
-          //USER_PASSWORD: ${{ github.event.inputs.password }}
+          USER_PASSWORD: ${{ github.event.inputs.password }}
           # Inject secrets needed by the script
           REDIS_URL: ${{ secrets.REDIS_URL }}
           ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
@@ -53,6 +53,6 @@ jobs:
             exit 1
           fi
 
-          //# Run the script, passing only the username as argument
+          # Run the script, passing only the username as argument
           # The script reads USER_PASSWORD from the environment
-          //python scripts/prewarm_user_cache.py "$TARGET_USERNAME"//
+          python scripts/prewarm_user_cache.py "$TARGET_USERNAME"
