@@ -7,7 +7,6 @@ on:
         description: "GUC Username (e.g., firstname.lastname)"
         required: true
         type: string
-
       password:
         description: "GUC Password (WARNING: Potentially exposed in logs)"
         required: true
@@ -36,23 +35,17 @@ jobs:
 
       - name: Run prewarm script for user
         env:
-          # Get username from the workflow input
-          TARGET_USERNAME: ${{ github.event.inputs.username }}
-          # !!! Get password DIRECTLY from input - INSECURE !!!
-          USER_PASSWORD: ${{ github.event.inputs.password }}
-          # Inject secrets needed by the script
+          TARGET_USERNAME: ${{ inputs.username }}
+          USER_PASSWORD: ${{ inputs.password }}
           REDIS_URL: ${{ secrets.REDIS_URL }}
           ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
         run: |
           echo "Attempting to prewarm cache for user: $TARGET_USERNAME"
           echo "::warning::Password provided directly as workflow input. This is insecure and may be logged."
 
-          # Check if password input is empty (basic validation)
           if [ -z "$USER_PASSWORD" ]; then
             echo "::error::Password input was empty."
             exit 1
           fi
 
-          # Run the script, passing only the username as argument
-          # The script reads USER_PASSWORD from the environment
           python scripts/prewarm_user_cache.py "$TARGET_USERNAME"
