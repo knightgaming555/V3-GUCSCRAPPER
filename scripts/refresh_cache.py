@@ -226,7 +226,7 @@ REFRESH_CONFIG = {
         "func": None,  # Wrapper handles this
         "args": [],
         "cache_prefix": "cms_content",  # Prefix used for key generation
-        "timeout": 3600, # 1 hour timeout as requested
+        "timeout": 18000, # 1 hour timeout as requested
         "cache_func": set_pickle_cache,
         "compare_func": None,  # Comparison handled differently or not implemented
     },
