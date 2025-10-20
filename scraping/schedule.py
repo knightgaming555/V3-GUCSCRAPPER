@@ -91,11 +91,24 @@ def extract_schedule_details_from_cell(cell_html: str) -> dict:
                 details["Location"] = location
             return details  # Found Tut/Lab with <small>, assume primary content
 
-        # Pattern 3: Tutorial/Lab within a nested <table>
-        nested_table = soup.select_one("table")  # Simpler selector
+        # Pattern 3: Tutorial/Lab or LECTURE within a nested <table>
+        nested_table = soup.select_one("table")
         if nested_table:
             tds = nested_table.select("td")
-            if len(tds) >= 3:  # Need at least Course, Loc, Type
+            if len(tds) >= 3:
+                # --- EDITED SECTION: START ---
+                # Check for the new Lecture format first, identified by "Lecture" in the 3rd cell.
+                third_td_text = tds[2].get_text(strip=True)
+                if "Lecture" in third_td_text:
+                    details["Type"] = "Lecture"
+                    # In the new format, Location is in the 2nd cell
+                    details["Location"] = tds[1].get_text(strip=True)
+                    # Course Name is in the 3rd cell (with "Lecture" removed)
+                    details["Course_Name"] = third_td_text.replace("Lecture", "").strip()
+                    return details # Found new lecture format, return.
+                # --- EDITED SECTION: END ---
+
+                # --- ORIGINAL LOGIC FOR TUT/LAB TABLES (NOW A FALLBACK) ---
                 course_name_parts = []
                 location = "Unknown"
                 type_str = "Unknown"
@@ -162,8 +175,6 @@ def extract_schedule_details_from_cell(cell_html: str) -> dict:
         )
 
     return details
-
-
 def parse_schedule_html(html: str) -> dict:
     """Parses the full schedule page HTML into a structured dictionary."""
     schedule = {}
