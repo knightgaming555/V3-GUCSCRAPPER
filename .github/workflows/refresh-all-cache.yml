@@ -3,7 +3,7 @@ name: Refresh All Cache Sections
 on:
   schedule:
     # Runs every 2 hours (Adjust cron as needed)
-    - cron: "0 */2 * * *"
+   - cron: "*/45 * * * *"
   workflow_dispatch: # Allows manual triggering
     inputs:
       username:
@@ -75,4 +75,5 @@ jobs:
           python scripts/refresh_cache.py 4 ${{ steps.args.outputs.username }}
 
       # Optional: Add a step here to check script exit codes if needed
+
 
