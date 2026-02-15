@@ -30,7 +30,7 @@ from scraping.cms import (
 from scraping.guc_data import (
     parse_notifications,
 )  # Assuming this parses the CMS Home notifications correctly
-from utils.mock_data import cmsdata_mockData, mock_content_map
+from utils.mock_data import cmsdata_mockData, mock_content_map, guc_mockData
 
 logger = logging.getLogger(__name__)
 cms_bp = Blueprint("cms_bp", __name__)
@@ -41,7 +41,7 @@ CMS_COURSE_DATA_CACHE_PREFIX = "cms_content"
 CMS_NOTIFICATIONS_CACHE_PREFIX = "cms_notifications"
 
 # Define a short TTL for in-memory cache for hot CMS content data
-CMS_CONTENT_MEMORY_CACHE_TTL = 30 # seconds
+CMS_CONTENT_MEMORY_CACHE_TTL = 1800 #30 Minutes
 
 
 def _is_cms_content_substantial(content_data: list) -> bool:
@@ -323,7 +323,7 @@ def api_cms_courses():
     if username == "google.user" and password == "google@3569":
         logger.info(f"Serving mock cms_courses data for user {username}")
         g.log_outcome = "mock_data_served"
-        return jsonify(cmsdata_mockData["courses"]), 200
+        return jsonify(cmsdata_mockData), 200
 
     try:
         password_to_use = get_password_for_readonly_session(username, password)
@@ -478,9 +478,53 @@ def api_cms_content():
 
         password_to_use = get_password_for_readonly_session(username, password)
 
-        # Use the helper function that now includes 2-tier caching logic
+        normalized_url = normalize_course_url(course_url)
+        if not normalized_url:
+            g.log_outcome = "validation_error"
+            g.log_error_message = "Invalid course URL provided."
+            return (
+                jsonify({"status": "error", "message": "Invalid course URL provided."}),
+                400,
+            )
+
+        # Generate cache key consistent with get_combined_course_data
+        global_hash_value = hashlib.md5(normalized_url.encode("utf-8")).hexdigest()
+        cache_key = f"{CMS_COURSE_DATA_CACHE_PREFIX}:{global_hash_value}"
+
+        # --- Cache Check (In-Memory first, then Redis) ---
+        if not force_refresh:
+            # 1. Check in-memory cache
+            in_memory_cache_check_start_time = time.perf_counter()
+            cached_data = get_from_memory_cache(cache_key)
+            in_memory_cache_check_duration = (time.perf_counter() - in_memory_cache_check_start_time) * 1000
+            logger.info(f"TIMING: In-memory Cache check for CMS content took {in_memory_cache_check_duration:.2f} ms")
+
+            if cached_data:
+                logger.info(f"Serving CMS content from IN-MEMORY cache for {username} - {normalized_url}")
+                g.log_outcome = "memory_cache_hit"
+                return jsonify(cached_data), 200
+
+            # 2. If not in-memory, check Redis cache
+            redis_cache_check_start_time = time.perf_counter()
+            cached_data = get_pickle_cache(cache_key)
+            redis_cache_check_duration = (time.perf_counter() - redis_cache_check_start_time) * 1000
+            logger.info(f"TIMING: Redis Cache check for CMS content took {redis_cache_check_duration:.2f} ms")
+
+            if cached_data:
+                logger.info(f"Serving CMS content from REDIS cache for {username} - {normalized_url}")
+                g.log_outcome = "redis_cache_hit"
+                # Set in in-memory cache for future rapid access
+                set_in_memory_cache(cache_key, cached_data, ttl=CMS_CONTENT_MEMORY_CACHE_TTL)
+                logger.info(f"Set CMS content in IN-MEMORY cache for {username}")
+                return jsonify(cached_data), 200
+
+        # --- Cache Miss or Force Refresh -> Fetch Fresh Data ---
+        logger.info(f"Cache miss or forced refresh for CMS content. Fetching for {username} - {normalized_url}")
+        g.log_outcome = "scrape_attempt"
+
+        # Use the helper function with force_refresh=True to ensure scraping
         content_data = get_combined_course_data(
-            username, password_to_use, course_url, force_refresh
+            username, password_to_use, course_url, force_refresh=True
         )
 
         if isinstance(content_data, dict) and "error" in content_data:
@@ -548,7 +592,7 @@ def api_cms_notifications():
     if username == "google.user" and password == "google@3569":
         logger.info(f"Serving mock cms_notifications data for user {username}")
         g.log_outcome = "mock_data_served"
-        return jsonify(cmsdata_mockData["notifications"]), 200
+        return jsonify(guc_mockData["notifications"]), 200
 
     try:
         password_to_use = get_password_for_readonly_session(username, password)

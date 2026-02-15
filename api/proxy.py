@@ -36,6 +36,7 @@ from utils.cache import (
     get_binary_simple,
     get_from_cache,
     set_in_cache,
+    delete_from_cache,
     redis_client,  # Import redis_client from cache utils
 )
 from utils.helpers import guess_content_type
@@ -62,6 +63,17 @@ REAL_USERNAME_FOR_MOCK = "mohamed.elsaadi"
 REAL_PASSWORD_FOR_MOCK = (
     "Messo-1245"  # IMPORTANT: Store this securely, e.g., env variables
 )
+
+
+def _is_cacheable_size(size_bytes: int | None) -> bool:
+    max_bytes = config.PROXY_CACHE_MAX_BYTES
+    if max_bytes is None:
+        return True
+    if max_bytes <= 0:
+        return False
+    if size_bytes is None:
+        return False
+    return size_bytes <= max_bytes
 
 
 # --- Helper Function to Get Credentials for Upstream Request ---
@@ -311,6 +323,14 @@ def proxy_file():
             f"TIMING: Proxy Redis cache check for key {cache_key} took {cache_check_duration:.2f} ms"
         )
 
+        if cached_content and not _is_cacheable_size(len(cached_content)):
+            logger.warning(
+                f"Cached file exceeds size limit ({len(cached_content)} bytes > {config.PROXY_CACHE_MAX_BYTES}). "
+                f"Bypassing cache and deleting key: {cache_key}"
+            )
+            delete_from_cache(cache_key)
+            cached_content = None
+
         if cached_content:
             # ... (cache hit logic, including range handling, remains the same) ...
             logger.info(f"Proxy cache hit for key: {cache_key}")
@@ -406,14 +426,20 @@ def proxy_file():
             )
 
             # ---> Save to cache using the *original* user's cache key <---
-            cache_save_start = time.perf_counter()
-            cache_success = save_binary_simple(cache_key, file_content)
-            cache_save_duration = (time.perf_counter() - cache_save_start) * 1000
-            logger.info(
-                f"TIMING: Proxy cache save to key {cache_key} took {cache_save_duration:.2f} ms"
-            )
-            if not cache_success:
-                logger.warning(f"Failed to cache file content (simple) for {cache_key}")
+            if _is_cacheable_size(total_size):
+                cache_save_start = time.perf_counter()
+                cache_success = save_binary_simple(cache_key, file_content)
+                cache_save_duration = (time.perf_counter() - cache_save_start) * 1000
+                logger.info(
+                    f"TIMING: Proxy cache save to key {cache_key} took {cache_save_duration:.2f} ms"
+                )
+                if not cache_success:
+                    logger.warning(f"Failed to cache file content (simple) for {cache_key}")
+            else:
+                logger.info(
+                    f"Skipping cache for {cache_key}; file size {total_size} bytes exceeds limit "
+                    f"{config.PROXY_CACHE_MAX_BYTES} bytes. Serving directly from upstream."
+                )
             # -----------------------------------------------------------
 
             # --- Range handling for LIVE fetch (remains the same logic, uses fetched content) ---
@@ -589,6 +615,14 @@ def extract_text():
         source = "redis-cache"
         # --------------------------------------------------------------------
 
+        if file_content and not _is_cacheable_size(len(file_content)):
+            logger.warning(
+                f"Cached file exceeds size limit ({len(file_content)} bytes > {config.PROXY_CACHE_MAX_BYTES}). "
+                f"Bypassing cache and deleting key: {binary_cache_key}"
+            )
+            delete_from_cache(binary_cache_key)
+            file_content = None
+
         if not file_content:
             logger.info(f"Binary cache miss for {binary_cache_key}. Fetching live.")
             source = "live-fetch"
@@ -603,7 +637,7 @@ def extract_text():
                 f"TIMING: Extract file fetch (upstream user {username_for_upstream}) took {fetch_duration:.2f} ms"
             )
 
-            if file_content:
+            if file_content and _is_cacheable_size(len(file_content)):
                 # ---> Save fetched content to binary cache (using *original* user's key) <---
                 save_start = time.perf_counter()
                 save_binary_simple(binary_cache_key, file_content)
@@ -612,6 +646,11 @@ def extract_text():
                     f"TIMING: Extract binary cache save to key {binary_cache_key} took {save_duration:.2f} ms"
                 )
                 # ---------------------------------------------------------------------------
+            elif file_content:
+                logger.info(
+                    f"Skipping binary cache for {binary_cache_key}; file size {len(file_content)} bytes exceeds limit "
+                    f"{config.PROXY_CACHE_MAX_BYTES} bytes. Using live fetch content only."
+                )
 
         if file_content is None:
             g.log_outcome = "fetch_error"

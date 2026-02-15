@@ -1,24 +1,28 @@
-# api/schedule.py
 import logging
+import requests
 from flask import Blueprint, request, jsonify, g
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import config
-from utils.auth import (
-    AuthError, 
-    get_password_for_readonly_session
-)
+from scraping.authenticate import authenticate_user_session
+from utils.auth import AuthError, get_password_for_readonly_session
 from utils.cache import get_from_cache, set_in_cache, generate_cache_key
-from scraping.schedule import (
-    scrape_schedule,
-    filter_schedule_details,
-)  # Import necessary functions
-from scraping.staff_schedule_scraper import scrape_staff_schedule # New import
+from utils.helpers import get_from_memory_cache, set_in_memory_cache
+from scraping.schedule import scrape_schedule, filter_schedule_details
 from utils.mock_data import schedule_mockData
+
+from scraping.staff_schedule_scraper import (
+    get_global_staff_list_and_tokens,
+    _find_staff_id_from_list,
+    scrape_staff_schedule_only,
+    get_staff_profile_details,
+)
 
 logger = logging.getLogger(__name__)
 schedule_bp = Blueprint("schedule_bp", __name__)
 
-# Define timings here or import from a central place if used elsewhere
+SCHEDULE_MEMORY_CACHE_TTL = 1800  # 30 Minutes
 TIMINGS = {
     "0": "8:15AM-9:45AM",
     "1": "10:00AM-11:30AM",
@@ -27,344 +31,316 @@ TIMINGS = {
     "4": "3:45PM-5:15PM",
 }
 
+SCHEDULE_SLOT_TIMINGS = {
+    0: "8:15AM-9:45AM",
+    1: "10:00AM-11:30AM",
+    2: "11:45AM-1:15PM",
+    3: "1:45PM-3:15PM",
+    4: "3:45PM-5:15PM",
+    5: "5:30PM-7:00PM",
+    6: "7:15PM-8:45PM",
+    7: "9:00PM-10:30PM",
+}
+
+
+def _parse_bool_like(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "y")
+    return bool(value)
+
 
 def is_schedule_empty(schedule_data: dict) -> bool:
-    """
-    Check if a schedule contains any meaningful course data.
-
-    Returns True if all Course_Name fields are empty, "Unknown", "Free", "N/A",
-    or if the schedule is completely empty.
-
-    Args:
-        schedule_data: The filtered schedule dictionary
-
-    Returns:
-        bool: True if schedule is considered empty, False otherwise
-    """
     if not schedule_data or not isinstance(schedule_data, dict):
         return True
-
-    # Values that indicate no meaningful course data
     empty_values = {"", "Unknown", "Free", "N/A", "Error", "Parsing Failed"}
-
     for day, periods in schedule_data.items():
         if not isinstance(periods, dict):
             continue
-
         for period_name, period_details in periods.items():
             if not isinstance(period_details, dict):
                 continue
-
             course_name = period_details.get("Course_Name", "")
-            # If we find any course name that's not in the empty values set,
-            # the schedule has meaningful data
             if course_name not in empty_values:
                 return False
-
-    # All course names were empty/unknown/free, so schedule is considered empty
     return True
+
+
+def _format_staff_schedule_for_client(parsed_staff_schedule: dict, timings: dict):
+    PERIOD_NAMES = {
+        0: "First Period",
+        1: "Second Period",
+        2: "Third Period",
+        3: "Fourth Period",
+        4: "Fifth Period",
+    }
+    DAYS_ORDER = ["Saturday", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+
+    if not parsed_staff_schedule or not isinstance(parsed_staff_schedule, dict):
+        return {}
+
+    staff_id = next(iter(parsed_staff_schedule.keys()))
+    staff_schedule = parsed_staff_schedule.get(staff_id, {})
+
+    formatted = {}
+    for day in DAYS_ORDER:
+        per_day = {}
+        day_has_content = False
+        for idx, period_name in PERIOD_NAMES.items():
+            slot_entries = staff_schedule.get(day, {}).get(idx, [])
+            if slot_entries:
+                entry = slot_entries[0]
+                course = (entry.get("group") or "Free").strip()
+                location = (entry.get("location") or "Free").strip()
+                typ = "Lecture"
+                low_course = course.lower()
+                if "tutorial" in low_course or "tut" in low_course:
+                    typ = "Tut"
+                elif "lab" in low_course:
+                    typ = "Lab"
+                elif course in ("Free", "N/A", "Unknown", ""):
+                    typ = "Free"
+
+                if typ != "Free":
+                    day_has_content = True
+
+                per_day[period_name] = {"Course_Name": course, "Location": location, "Type": typ}
+            else:
+                per_day[period_name] = {"Course_Name": "Free", "Location": "Free", "Type": "Free"}
+
+        if day_has_content:
+            formatted[day] = per_day
+
+    return formatted
 
 
 @schedule_bp.route("/schedule", methods=["GET"])
 def api_schedule():
-    """
-    Endpoint to fetch the user's schedule.
-    Requires query params: username, password.
-    """
-    if request.args.get("bot", "").lower() == "true":
-        logger.info("Received bot health check request for Schedule API.")
-        g.log_outcome = "bot_check_success"
-        return jsonify({
-            "status": "Success",
-            "message": "Schedule API route is up!",
-            "data": None,
-        }), 200
-
     username = request.args.get("username")
     password = request.args.get("password")
+    force_refresh = _parse_bool_like(request.args.get("force_refresh"))
     g.username = username
 
+    if not all([username, password]):
+        return jsonify({"status": "error", "message": "Missing required parameters: username, password"}), 400
+
+    # optional mock user
     if username == "google.user" and password == "google@3569":
         logger.info(f"Serving mock schedule data for user {username}")
-        g.log_outcome = "mock_data_served"
         return jsonify(schedule_mockData), 200
 
     try:
-        if not username or not password:
-            g.log_outcome = "validation_error_schedule"
-            g.log_error_message = "Missing required parameters (username, password) for Schedule"
-            return jsonify({
-                "status": "error",
-                "message": "Missing required parameters: username, password"
-            }), 400
-
         password_to_use = get_password_for_readonly_session(username, password)
-
         cache_key = generate_cache_key("schedule", username)
+
+        # 1) in-memory cache
+        in_memory_cache_check_start_time = time.perf_counter()
+        cached_data = get_from_memory_cache(cache_key)
+        in_memory_cache_check_duration = (time.perf_counter() - in_memory_cache_check_start_time) * 1000
+        logger.info(f"TIMING: In-memory Cache check for schedule took {in_memory_cache_check_duration:.2f} ms")
+
+        if cached_data is not None:
+            logger.info(f"Serving schedule from IN-MEMORY cache for {username}")
+            g.log_outcome = "memory_cache_hit"
+            return jsonify(cached_data), 200
+
+        # 2) redis cache
+        redis_cache_check_start_time = time.perf_counter()
         cached_data = get_from_cache(cache_key)
+        redis_cache_check_duration = (time.perf_counter() - redis_cache_check_start_time) * 1000
+        logger.info(f"TIMING: Redis Cache check for schedule took {redis_cache_check_duration:.2f} ms")
 
-        if cached_data:
-            # Check if cached data is an empty array (empty schedule)
-            if isinstance(cached_data, list) and len(cached_data) == 0:
-                logger.info(f"Serving empty schedule from cache for {username}")
-                g.log_outcome = "cache_hit_empty_schedule"
-                return jsonify([]), 200
-            # Validate cached data structure (should be a list/tuple of length 2)
-            elif isinstance(cached_data, (list, tuple)) and len(cached_data) == 2:
-                logger.info(f"Serving schedule from cache for {username}")
-                g.log_outcome = "cache_hit"
-                # Return the cached tuple directly
-                return jsonify(cached_data), 200
-            else:
-                logger.warning(
-                    f"Invalid schedule data format found in cache for {username}. Fetching fresh data."
-                )
-                # Optionally delete invalid cache item here
-                # delete_from_cache(cache_key)
+        if cached_data is not None and not force_refresh:
+            logger.info(f"Serving schedule from REDIS cache for {username}")
+            g.log_outcome = "redis_cache_hit"
+            # populate in-memory cache for faster subsequent hits
+            set_in_memory_cache(cache_key, cached_data, ttl=SCHEDULE_MEMORY_CACHE_TTL)
+            return jsonify(cached_data), 200
 
-        # --- Cache Miss -> Scrape ---
-        logger.info(f"Cache miss for schedule. Starting scrape for {username}")
+        # Cache miss or force refresh -> scrape
+        logger.info(f"Cache miss or forced refresh for schedule. Scraping for {username}")
         g.log_outcome = "scrape_attempt"
+        scrape_start = time.perf_counter()
+        raw_schedule = scrape_schedule(username, password_to_use)
+        scrape_duration = (time.perf_counter() - scrape_start) * 1000
+        logger.info(f"TIMING: Schedule scrape took {scrape_duration:.2f} ms")
 
-        # Call the scraping function
-        # scrape_schedule now returns the raw parsed schedule dict or dict with 'error'
-        raw_schedule_data = scrape_schedule(username, password_to_use)
+        if not raw_schedule or ("error" in raw_schedule and raw_schedule.get("error")):
+            error_msg = raw_schedule.get("error", "Failed to scrape schedule.") if isinstance(raw_schedule, dict) else "Failed to scrape schedule."
+            logger.error(f"Schedule scraping failed for {username}: {error_msg}")
+            g.log_outcome = "scrape_fail"
+            return jsonify({"status": "error", "message": error_msg}), 502
 
-        # --- Handle Scraping Result ---
-        if isinstance(raw_schedule_data, dict) and "error" in raw_schedule_data:
-            error_msg = raw_schedule_data["error"]
-            logger.error(f"Schedule scraping error for {username}: {error_msg}")
-            g.log_error_message = error_msg
-            # Map error message to status code and log outcome
-            status_code = 500  # Default
-            if "Authentication failed" in error_msg:
-                g.log_outcome = "scrape_auth_error"
-                status_code = 401
-            elif any(
-                e in error_msg
-                for e in [
-                    "timeout",
-                    "Connection error",
-                    "HTTP error",
-                    "Failed to fetch",
-                ]
-            ):
-                g.log_outcome = "scrape_connection_error"
-                status_code = 504  # Gateway timeout / upstream error
-            elif any(e in error_msg for e in ["parse", "Failed to find", "content"]):
-                g.log_outcome = "scrape_parsing_error"
-                status_code = 502  # Bad gateway - parsing issue
-            else:
-                g.log_outcome = "scrape_unknown_error"
-            return (
-                jsonify({"status": "error", "message": error_msg, "data": None}),
-                status_code,
-            )
+        filtered_data = filter_schedule_details(raw_schedule)
+        response_data = [filtered_data, TIMINGS]
 
-        elif not raw_schedule_data or not isinstance(raw_schedule_data, dict):
-            # Handle case where scraper returns None or unexpected type
-            logger.error(
-                f"Schedule scraping returned invalid data type for {username}: {type(raw_schedule_data)}"
-            )
-            g.log_outcome = "scrape_no_result"
-            g.log_error_message = "Scraping function returned invalid data"
-            return (
-                jsonify(
-                    {
-                        "status": "error",
-                        "message": "Failed to fetch schedule data (invalid result)",
-                    }
-                ),
-                500,
-            )
-        else:
-            # --- Success ---
-            g.log_outcome = "scrape_success"
-            logger.info(f"Successfully scraped schedule for {username}")
+        # cache result (redis + in-memory)
+        set_in_cache(cache_key, response_data, timeout=config.CACHE_LONG_TIMEOUT)
+        set_in_memory_cache(cache_key, response_data, ttl=SCHEDULE_MEMORY_CACHE_TTL)
+        logger.info(f"Cached schedule for {username}")
 
-            # Filter the raw data
-            filtered_data = filter_schedule_details(raw_schedule_data)
-
-            # Check if the schedule is empty (no meaningful course data)
-            if is_schedule_empty(filtered_data):
-                logger.info(f"Schedule for {username} contains no meaningful course data, returning empty array")
-                g.log_outcome = "scrape_success_empty_schedule"
-
-                # Cache the empty result
-                set_in_cache(
-                    cache_key, [], timeout=config.CACHE_LONG_TIMEOUT
-                )  # Cache empty array
-                logger.info(f"Cached empty schedule for {username}")
-
-                return jsonify([]), 200
-
-            # Prepare the response tuple (filtered_schedule, timings)
-            response_data = (filtered_data, TIMINGS)
-
-            # Cache the successful result (the tuple)
-            set_in_cache(
-                cache_key, response_data, timeout=config.CACHE_LONG_TIMEOUT
-            )  # Use long timeout
-            logger.info(f"Cached fresh schedule for {username}")
-
-            return jsonify(response_data), 200
+        g.log_outcome = "scrape_success"
+        return jsonify(response_data), 200
 
     except AuthError as e:
-        # Handle authentication errors from validate_credentials_flow
-        logger.warning(
-            f"AuthError during schedule request for {username}: {e.log_message}"
-        )
-        g.log_outcome = e.log_outcome
-        g.log_error_message = e.log_message
+        logger.warning(f"AuthError during /schedule for {username}: {e}")
         return jsonify({"status": "error", "message": str(e)}), e.status_code
     except Exception as e:
-        # Catch unexpected errors in the endpoint logic
-        logger.exception(
-            f"Unhandled exception during /api/schedule request for {username}: {e}"
-        )
-        g.log_outcome = "internal_error_unhandled"
-        g.log_error_message = f"Unhandled exception: {e}"
-        return (
-            jsonify(
-                {"status": "error", "message": "An internal server error occurred"}
-            ),
-            500,
-        )
+        logger.exception(f"Unhandled exception in /schedule for {username}: {e}")
+        return jsonify({"status": "error", "message": "An internal server error occurred."}), 500
+
+
+@schedule_bp.route("/staff_list", methods=["GET"])
+def api_staff_list():
+    username = request.args.get("username")
+    password = request.args.get("password")
+    force_refresh = _parse_bool_like(request.args.get("force_refresh", False))
+    g.username = username
+
+    if not all([username, password]):
+        return jsonify({"status": "error", "message": "Missing required parameters: username, password"}), 400
+
+    try:
+        actual_pw = get_password_for_readonly_session(username, password)
+        session = authenticate_user_session(username, actual_pw)
+        if not session:
+            return jsonify({"status": "error", "message": "Failed to authenticate with GUC portal"}), 502
+
+        staff_list, _ = get_global_staff_list_and_tokens(session, force_refresh=force_refresh)
+
+        if staff_list is None:
+            return jsonify({"status": "error", "message": "Failed to fetch staff list from upstream"}), 502
+
+        staff_dict = {str(item["id"]): item["name"] for item in staff_list if "id" in item and "name" in item}
+        return jsonify({"status": "success", "data": staff_dict}), 200
+
+    except AuthError as e:
+        return jsonify({"status": "error", "message": str(e)}), e.status_code
+    except Exception as e:
+        logger.exception(f"Unhandled exception in /staff_list for {username}: {e}")
+        return jsonify({"status": "error", "message": "An internal server error occurred."}), 500
+
 
 @schedule_bp.route("/staff_schedule", methods=["POST"])
 def api_staff_schedule():
-    """
-    Endpoint to fetch a specific staff member's schedule using their name.
-    Requires a JSON body with: username, password, staff_name
-    """
     data = request.get_json()
     if not data:
-        g.log_outcome = "validation_error"
-        g.log_error_message = "Missing JSON request body for staff schedule"
         return jsonify({"status": "error", "message": "Missing JSON request body"}), 400
 
     username = data.get("username")
-    password = data.get("password") # This is the temporary password/token from client
+    password = data.get("password")
     staff_name = data.get("staff_name")
-    g.username = username # For logging context
+    force_refresh = _parse_bool_like(data.get("force_refresh", False))
+    g.username = username
 
-    required_params = [
-        ("username", username),
-        ("password", password),
-        ("staff_name", staff_name),
-    ]
+    if not all([username, password, staff_name]):
+        return jsonify({"status": "error", "message": "Missing required JSON parameters: username, password, staff_name"}), 400
 
-    missing = [name for name, val in required_params if not val or not str(val).strip()]
-    if missing:
-        msg = f"Missing or empty required JSON parameters for staff schedule: {', '.join(missing)}"
-        logger.warning(f"{msg} (User: {username or 'N/A'})")
-        g.log_outcome = "validation_error_staff_schedule"
-        g.log_error_message = msg
-        return jsonify({"status": "error", "message": msg}), 400
+    normalized_staff_name = staff_name.strip()
+    user_cache_key = generate_cache_key("staff_schedule", username, normalized_staff_name)
 
-    # Normalize staff_name for consistent caching and logging
-    normalized_staff_name = staff_name.strip() # Used for user-specific cache key and logging
+    # 1) check in-memory cache first
+    if not force_refresh:
+        in_memory_cache_check_start_time = time.perf_counter()
+        cached_data = get_from_memory_cache(user_cache_key)
+        in_memory_cache_check_duration = (time.perf_counter() - in_memory_cache_check_start_time) * 1000
+        logger.info(f"TIMING: In-memory Cache check for staff schedule took {in_memory_cache_check_duration:.2f} ms")
+
+        if cached_data is not None:
+            logger.info(f"Serving staff schedule from IN-MEMORY cache for {username}")
+            return jsonify(cached_data), 200
+
+    # 2) check redis cache
+    if not force_refresh:
+        redis_cache_check_start_time = time.perf_counter()
+        cached_data = get_from_cache(user_cache_key)
+        redis_cache_check_duration = (time.perf_counter() - redis_cache_check_start_time) * 1000
+        logger.info(f"TIMING: Redis Cache check for staff schedule took {redis_cache_check_duration:.2f} ms")
+
+        if cached_data is not None:
+            logger.info(f"Serving staff schedule from REDIS cache for {username}")
+            set_in_memory_cache(user_cache_key, cached_data, ttl=SCHEDULE_MEMORY_CACHE_TTL)
+            return jsonify(cached_data), 200
 
     try:
-        # --- Pre-warmed Cache Check ---
-        # Key format matches 'scripts/refresh_staff_schedules.py'
-        # _normalize_staff_name -> " ".join(name.lower().split())
-        # refresh script key part -> "_".join(_normalize_staff_name(original_staff_name).split())
-        prewarm_key_staff_part = "_".join(normalized_staff_name.lower().split())
-        prewarm_cache_key = f"staff_schedule_PREWARM_{prewarm_key_staff_part}"
-        
-        logger.debug(f"Checking pre-warmed cache for staff '{normalized_staff_name}' with key: {prewarm_cache_key}")
-        prewarmed_cached_data = get_from_cache(prewarm_cache_key)
-
-        if prewarmed_cached_data:
-            if isinstance(prewarmed_cached_data, dict) and "error" not in prewarmed_cached_data:
-                logger.info(f"Serving staff schedule for '{normalized_staff_name}' from PREWARMED cache (User: {username})")
-                g.log_outcome = "staff_prewarm_cache_hit"
-                return jsonify({"status": "success", "data": prewarmed_cached_data}), 200
-            else:
-                logger.warning(f"Invalid or error data found in PREWARMED staff schedule cache for '{normalized_staff_name}' (User: {username}). Key: {prewarm_cache_key}. Proceeding to user-specific cache.")
-
-        # --- User-Specific Cache Check (existing logic) ---
-        user_cache_key = generate_cache_key("staff_schedule", username, normalized_staff_name) # `normalized_staff_name` is already stripped
-        logger.debug(f"Checking user-specific cache for staff '{normalized_staff_name}' (User: {username}) with key: {user_cache_key}")
-        user_cached_data = get_from_cache(user_cache_key)
-        
-        if user_cached_data:
-            if isinstance(user_cached_data, dict) and "error" not in user_cached_data:
-                logger.info(f"Serving staff schedule for '{normalized_staff_name}' from USER-SPECIFIC cache for user {username}")
-                g.log_outcome = "staff_user_cache_hit" # Differentiated log outcome
-                return jsonify({"status": "success", "data": user_cached_data}), 200
-            else:
-                logger.warning(f"Invalid or error data found in USER-SPECIFIC staff schedule cache for '{normalized_staff_name}' (User: {username}). Key: {user_cache_key}. Fetching fresh.")
-
-        logger.info(f"Cache miss for staff schedule: '{normalized_staff_name}' (User: {username}) in both pre-warmed and user-specific caches. Proceeding to scrape.")
+        logger.info(f"Cache miss for '{normalized_staff_name}'. Proceeding to scrape.")
         actual_password = get_password_for_readonly_session(username, password)
-        # AuthError from get_password_for_readonly_session will be caught by the AuthError handler below
-
-        from scraping.authenticate import authenticate_user_session 
         session = authenticate_user_session(username, actual_password)
         if not session:
-            logger.error(f"Failed to get authenticated session for {username} for staff schedule (staff: {normalized_staff_name}).")
-            g.log_outcome = "session_error_staff_schedule"
-            g.log_error_message = "Failed to establish authenticated session with GUC portal."
             return jsonify({"status": "error", "message": "Failed to authenticate with GUC portal"}), 502
 
-        logger.info(f"Fetching staff schedule for staff_name: '{normalized_staff_name}', requested by {username}")
-        
-        schedule_result = scrape_staff_schedule(session, normalized_staff_name)
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (compatible; GUC-API/1.0)",
+            "Referer": "https://apps.guc.edu.eg",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
 
-        if isinstance(schedule_result, dict) and "error" in schedule_result:
-            error_msg = schedule_result["error"]
-            logger.warning(f"Staff schedule scraping error for staff_name '{normalized_staff_name}' (User: {username}): {error_msg}")
-            g.log_error_message = error_msg
-            status_code = 500 # Default internal error
-            
-            if "Could not find staff ID" in error_msg:
-                g.log_outcome = "staff_name_not_found"
-                status_code = 404
-            elif "timed out" in error_msg.lower():
-                g.log_outcome = "staff_scrape_timeout"
-                status_code = 504
-            elif "HTTP error" in error_msg or "Network or HTTP error" in error_msg or "Network or request error" in error_msg:
-                g.log_outcome = "staff_scrape_http_error"
-                status_code = 502
-            elif "parsing failed" in error_msg.lower() or "ASP.NET tokens" in error_msg:
-                g.log_outcome = "staff_scrape_parsing_or_token_error"
-                status_code = 502
-            else:
-                g.log_outcome = "staff_scrape_unknown_error"
-            # Do not cache errors
-            return jsonify({"status": "error", "message": f"Failed to fetch staff schedule for '{normalized_staff_name}': {error_msg}"}), status_code
-        
-        # Ensure schedule_result is a dict and doesn't have an error before caching
-        if isinstance(schedule_result, dict) and "error" not in schedule_result:
-            # Cache the successful result in the USER-SPECIFIC cache
-            set_in_cache(
-                user_cache_key, # Use the user_cache_key defined earlier
-                schedule_result,
-                timeout=config.CACHE_STAFF_SCHEDULE_TIMEOUT # Existing timeout for user-specific staff schedule
-            )
-            logger.info(f"Cached fresh staff schedule for '{normalized_staff_name}' in USER-SPECIFIC cache for user {username} (Key: {user_cache_key})")
-            g.log_outcome = "staff_scrape_success_cached_user"
-            return jsonify({"status": "success", "data": schedule_result}), 200
-        elif isinstance(schedule_result, dict) and "error" in schedule_result: # Already handled above, but as a safeguard
-             logger.error(f"Scraping returned an error for '{normalized_staff_name}', not caching. Error: {schedule_result.get('error')}")
-             # The error response is already constructed and returned above this block.
-             # This path should ideally not be hit if error handling above is complete.
-             # For safety, ensure an error is returned if somehow reached:
-             return jsonify({"status": "error", "message": schedule_result.get('error', 'Scraping failed'), "data": None}), 500
-        else: # Scraper returned something unexpected (not a dict or dict without error but also not success)
-            logger.error(f"Scraping for '{normalized_staff_name}' returned unexpected data type or format. Data: {str(schedule_result)[:200]}. Not caching.")
-            g.log_outcome = "staff_scrape_invalid_data"
-            return jsonify({"status": "error", "message": "Scraping returned invalid data for staff schedule.", "data": None}), 500
+        logger.info("Fetching global staff list and tokens...")
+        staff_list, schedule_tokens = get_global_staff_list_and_tokens(session, force_refresh=force_refresh)
+
+        if not staff_list or not schedule_tokens:
+            msg = "Failed to retrieve the global staff list or necessary security tokens from the GUC portal."
+            logger.error(msg)
+            return jsonify({"status": "error", "message": msg}), 502
+
+        staff_id = _find_staff_id_from_list(staff_list, normalized_staff_name)
+        if not staff_id:
+            msg = f"Could not find a staff member matching the name '{normalized_staff_name}'."
+            logger.warning(msg)
+            return jsonify({"status": "error", "message": msg}), 404
+
+        staff_details = next((s for s in staff_list if s['id'] == staff_id), None)
+        exact_staff_name = staff_details['name'] if staff_details else normalized_staff_name
+        logger.info(f"Found Staff ID: {staff_id} with exact name: '{exact_staff_name}'")
+
+        profile_cache_key = generate_cache_key("staff_profile", staff_id)
+        # check in-memory before redis for profile
+        profile_part = get_from_memory_cache(profile_cache_key)
+        if profile_part is None:
+            profile_part = get_from_cache(profile_cache_key)
+
+        schedule_part = None
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futures = {}
+            futures[ex.submit(scrape_staff_schedule_only, session, staff_id, schedule_tokens)] = "schedule"
+            if profile_part is None:
+                futures[ex.submit(get_staff_profile_details, session, exact_staff_name, staff_id)] = "profile"
+
+            for fut in as_completed(futures):
+                name = futures[fut]
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    logger.exception("Worker failed for %s: %s", name, e)
+                    res = None
+
+                if name == "schedule":
+                    schedule_part = res
+                elif name == "profile":
+                    profile_part = res
+                    if isinstance(profile_part, dict) and "error" not in profile_part:
+                        set_in_cache(profile_cache_key, profile_part, timeout=60 * 60 * 12)  # 12 hours
+                        set_in_memory_cache(profile_cache_key, profile_part, ttl=60 * 60 * 12)
+
+        if schedule_part is None:
+            msg = f"Found staff '{exact_staff_name}', but failed to retrieve their schedule data due to a network or server error."
+            logger.error(msg)
+            return jsonify({"status": "error", "message": msg}), 502
+
+        formatted_schedule = _format_staff_schedule_for_client(schedule_part, SCHEDULE_SLOT_TIMINGS)
+        response_payload = [formatted_schedule, SCHEDULE_SLOT_TIMINGS, profile_part]
+
+        # cache the response for this user+staff
+        set_in_cache(user_cache_key, response_payload, timeout=config.CACHE_STAFF_SCHEDULE_TIMEOUT)
+        set_in_memory_cache(user_cache_key, response_payload, ttl=SCHEDULE_MEMORY_CACHE_TTL)
+        logger.info(f"Cached fresh staff schedule and profile for '{exact_staff_name}'.")
+
+        return jsonify(response_payload), 200
 
     except AuthError as e:
         logger.warning(f"AuthError for {username} during staff schedule request (staff: {normalized_staff_name}): {e.log_message}")
-        g.log_outcome = e.log_outcome
-        g.log_error_message = e.log_message
         return jsonify({"status": "error", "message": str(e)}), e.status_code
     except Exception as e:
-        logger.exception(f"Unhandled exception for {username} during /api/staff_schedule (staff: {normalized_staff_name}): {e}")
-        g.log_outcome = "internal_error_unhandled_staff"
-        g.log_error_message = f"Unhandled staff schedule exception: {e}"
-        return jsonify({"status": "error", "message": f"An internal server error occurred processing staff schedule for '{normalized_staff_name}'."}), 500
+        logger.exception(f"Unhandled exception during staff schedule request for '{normalized_staff_name}': {e}")
+        return jsonify({"status": "error", "message": "An internal server error occurred."}), 500

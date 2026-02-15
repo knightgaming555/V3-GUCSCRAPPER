@@ -155,6 +155,70 @@ def api_country_stats():
         return jsonify({"error": f"Failed to calculate stats: {e}"}), 500
 
 
+# --- User Stats ---
+@misc_bp.route("/user_stats", methods=["GET"])
+def api_user_stats():
+    """
+    Returns statistics about user IDs (uniqappno) grouped by student year prefix.
+    Requires admin secret.
+    """
+    # Requires Admin Auth
+    if not check_admin_secret():
+        return jsonify({"error": "Unauthorized"}), 403
+    g.log_outcome = "success"
+
+    if not redis_client:
+        g.log_outcome = "redis_error"
+        return jsonify({"error": "Redis client not available"}), 503
+
+    stats = {}
+    total_users = 0
+    mget_calls = 0
+    try:
+        # Use SCAN to get all guc_data:* keys
+        cursor = 0
+        keys = []
+        while True:
+            cursor, partial_keys = redis_client.scan(cursor, match="guc_data:*", count=100)
+            keys.extend(partial_keys)
+            if cursor == 0:
+                break
+
+        if not keys:
+            return jsonify({"stats": {}, "total_users": 0, "mget_calls": 0}), 200
+
+        # Fetch data in batches using MGET for efficiency
+        batch_size = 100
+        for i in range(0, len(keys), batch_size):
+            batch_keys = keys[i:i + batch_size]
+            # MGET returns list of bytes or None
+            batch_values = redis_client.mget(batch_keys)
+            mget_calls += 1
+            for key_bytes, value_bytes in zip(batch_keys, batch_values):
+                if value_bytes:
+                    try:
+                        # Decode JSON
+                        data = json.loads(value_bytes.decode("utf-8"))
+                        student_info = data.get("student_info", {})
+                        uniqappno = student_info.get("uniqappno", "")
+                        if uniqappno:
+                            # Extract prefix (e.g., "64" from "64-1234")
+                            prefix = uniqappno.split("-")[0] if "-" in uniqappno else uniqappno
+                            stats[prefix] = stats.get(prefix, 0) + 1
+                            total_users += 1
+                    except (json.JSONDecodeError, UnicodeDecodeError, KeyError) as e:
+                        logger.warning(f"Error parsing data for key {key_bytes}: {e}")
+        return jsonify({"stats": stats, "total_users": total_users, "mget_calls": mget_calls}), 200
+    except redis.exceptions.ConnectionError as e:
+        logger.error(f"Redis connection error getting user stats: {e}")
+        g.log_outcome = "redis_error"
+        return jsonify({"error": f"Failed to connect to Redis: {e}"}), 503
+    except Exception as e:
+        logger.exception(f"Error calculating user stats: {e}")
+        g.log_outcome = "internal_error"
+        return jsonify({"error": f"Failed to calculate stats: {e}"}), 500
+
+
 # --- Debug/Version Endpoint ---
 @misc_bp.route("/version", methods=["GET"])
 def api_version():
