@@ -66,6 +66,7 @@ try:
         scrape_course_content,
         scrape_course_announcements,
     )
+    from scraping.authenticate import authenticate_user
     from api.schedule import is_schedule_empty
 except ImportError as e:
     print(f"Error importing scraping functions: {e}.", file=sys.stderr)
@@ -372,6 +373,8 @@ SECTION_MAP = {
     "3": ["attendance", "exam_seats"],
     "4": ["cms_content"],
 }
+AUTH_PRECHECK_ENABLED = os.getenv("REFRESH_PRECHECK_AUTH", "true").strip().lower() in ("true", "1", "yes", "y")
+MAX_CONCURRENT_AUTH_CHECKS = int(os.getenv("REFRESH_PRECHECK_CONCURRENCY", "10"))
 
 # --- Wrapper for Single Course Content Refresh ---
 async def _refresh_single_cms_course(username_for_creds, password_for_creds, course_entry):
@@ -796,6 +799,47 @@ async def main():
         return
 
     overall_results = {}
+
+    # --- Optional: Pre-check credentials to avoid unnecessary scraping calls ---
+    if AUTH_PRECHECK_ENABLED:
+        logger.info("Pre-checking user credentials before refresh...")
+        auth_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AUTH_CHECKS)
+        valid_users = {}
+        invalid_users = {}
+
+        async def _check_user_auth(u, p):
+            async with auth_semaphore:
+                loop = asyncio.get_running_loop()
+                try:
+                    ok = await loop.run_in_executor(None, authenticate_user, u, p)
+                except Exception as e:
+                    logger.warning(f"Auth precheck exception for {u}: {e}")
+                    ok = False
+                return u, ok
+
+        auth_tasks = [asyncio.create_task(_check_user_auth(u, p)) for u, p in users_to_process.items()]
+        auth_results = await asyncio.gather(*auth_tasks)
+
+        for u, ok in auth_results:
+            if ok:
+                valid_users[u] = users_to_process[u]
+            else:
+                invalid_users[u] = users_to_process[u]
+
+        if invalid_users:
+            logger.warning(f"Auth precheck failed for {len(invalid_users)} user(s). Skipping their refresh.")
+            for u in invalid_users:
+                overall_results[u] = {dt: "skipped: auth_precheck_failed" for dt in data_types_to_run}
+
+        users_to_process = valid_users
+
+        if target_username and target_username not in users_to_process:
+            logger.error(f"Target user {target_username} failed auth precheck. Exiting.")
+            return
+
+        if not users_to_process:
+            logger.warning("No users passed auth precheck. Exiting.")
+            return
     user_semaphore = asyncio.Semaphore(getattr(config, 'MAX_CONCURRENT_USERS', 10))
     refreshed_course_urls_this_run = set()
 
