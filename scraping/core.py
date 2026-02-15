@@ -74,14 +74,18 @@ def create_session(
         config.DEFAULT_REQUEST_TIMEOUT * 2,
     )
 
-    # Handle SSL Verification based on config
+    # Handle SSL Verification based on config (bool or custom CA bundle path)
     session.verify = config.VERIFY_SSL
-    if not config.VERIFY_SSL:
+    if config.VERIFY_SSL is False:
         # Suppress InsecureRequestWarning if verification is disabled
         import urllib3
 
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         logger.warning("SSL verification is disabled. Requests may be insecure.")
+    elif isinstance(config.VERIFY_SSL, str):
+        logger.info(
+            f"Using custom CA bundle for SSL verification: {config.VERIFY_SSL}"
+        )
 
     return session
 
