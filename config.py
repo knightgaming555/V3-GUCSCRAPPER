@@ -67,7 +67,17 @@ class Config:
     GUC_DATA_URLS = [GUC_INDEX_URL, GUC_NOTIFICATIONS_URL]  # Used by guc_data scraper
 
     # Scraping Config
-    VERIFY_SSL = os.environ.get("VERIFY_SSL", "True").lower() == "true"
+    # VERIFY_SSL can be:
+    # - "false" to disable SSL verification (current default)
+    # - "true" to use system CAs
+    # - a file path to a custom CA bundle (recommended if available)
+    _VERIFY_SSL_RAW = os.environ.get("VERIFY_SSL", "False")
+    if _VERIFY_SSL_RAW.lower() in ("true", "1", "t", "yes", "y"):
+        VERIFY_SSL = True
+    elif _VERIFY_SSL_RAW.lower() in ("false", "0", "f", "no", "n"):
+        VERIFY_SSL = False
+    else:
+        VERIFY_SSL = _VERIFY_SSL_RAW
     DEFAULT_REQUEST_TIMEOUT = 15  # Default timeout for individual requests (seconds)
     DEFAULT_MAX_RETRIES = 3
     DEFAULT_RETRY_DELAY = 2  # Base delay for retries (seconds)
@@ -82,6 +92,9 @@ class Config:
     PROXY_CHUNK_SIZE = 262144  # 256KB
     PROXY_CACHE_CHUNK_SIZE = 1024 * 1024  # 1MB for Redis storage
     PROXY_CACHE_EXPIRY = 1800  # 30 minutes for proxied files
+    PROXY_CACHE_MAX_BYTES = int(
+        os.environ.get("PROXY_CACHE_MAX_BYTES", 10 * 1024 * 1024)
+    )  # 10MB default
 
     # Default Dev Announcement (moved here for central config)
     DEFAULT_DEV_ANNOUNCEMENT = {
@@ -95,6 +108,7 @@ class Config:
         "title": "Rate our app",
     }
     REDIS_DEV_ANNOUNCEMENT_KEY = "dev_announcement"
+    REDIS_DEV_ANNOUNCEMENT_ENABLED_KEY = "dev_announcement_enabled"
 
 
 # Create a singleton instance for easy access
