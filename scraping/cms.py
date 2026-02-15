@@ -121,7 +121,10 @@ def _get_dacast_access_url(player_content_id: str) -> str | None:
     logger.debug(f"Fetching Dacast info URL: {info_url}")
     try:
         response = requests.get(
-            info_url, timeout=DACAST_REQUEST_TIMEOUT, headers=DACAST_HEADERS
+            info_url,
+            timeout=DACAST_REQUEST_TIMEOUT,
+            headers=DACAST_HEADERS,
+            verify=config.VERIFY_SSL,
         )
         response.raise_for_status()
         data = response.json()

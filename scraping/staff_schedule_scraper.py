@@ -122,7 +122,9 @@ def get_global_staff_list_and_tokens(session: requests.Session, force_refresh: b
     if cached_staff_list:
         logger.info(f"Global staff list cache hit. Found {len(cached_staff_list)} staff members.")
         try:
-            response = session.get(STAFF_SCHEDULE_URL, timeout=10)
+            response = session.get(
+                STAFF_SCHEDULE_URL, timeout=10, verify=config.VERIFY_SSL
+            )
             response.raise_for_status()
             fresh_tokens = _extract_asp_tokens(BeautifulSoup(response.text, 'lxml'))
             return cached_staff_list, fresh_tokens
@@ -133,7 +135,9 @@ def get_global_staff_list_and_tokens(session: requests.Session, force_refresh: b
     if _global_staff_lock.acquire(blocking=False):
         try:
             logger.info("Cache miss: fetching fresh global staff list and tokens.")
-            response = session.get(STAFF_SCHEDULE_URL, timeout=15)
+            response = session.get(
+                STAFF_SCHEDULE_URL, timeout=15, verify=config.VERIFY_SSL
+            )
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'lxml')
             asp_tokens = _extract_asp_tokens(soup)
@@ -155,14 +159,18 @@ def get_global_staff_list_and_tokens(session: requests.Session, force_refresh: b
             cached = get_from_cache(GLOBAL_STAFF_LIST_CACHE_KEY)
             if cached:
                 try:
-                    response = session.get(STAFF_SCHEDULE_URL, timeout=6)
+                    response = session.get(
+                        STAFF_SCHEDULE_URL, timeout=6, verify=config.VERIFY_SSL
+                    )
                     response.raise_for_status()
                     fresh_tokens = _extract_asp_tokens(BeautifulSoup(response.text, 'lxml'))
                     return cached, fresh_tokens
                 except Exception:
                     return cached, None
         try:
-            response = session.get(STAFF_SCHEDULE_URL, timeout=12)
+            response = session.get(
+                STAFF_SCHEDULE_URL, timeout=12, verify=config.VERIFY_SSL
+            )
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'lxml')
             asp_tokens = _extract_asp_tokens(soup)
@@ -262,7 +270,9 @@ def scrape_staff_schedule_only(session: requests.Session, staff_id: str, asp_tok
         'ta[]': staff_id
     }
     try:
-        response = session.post(STAFF_SCHEDULE_URL, data=payload, timeout=15)
+        response = session.post(
+            STAFF_SCHEDULE_URL, data=payload, timeout=15, verify=config.VERIFY_SSL
+        )
         response.raise_for_status()
         parsed_schedules = parse_staff_schedule(response.text, requested_staff_ids=[staff_id])
         if not parsed_schedules or staff_id not in parsed_schedules:
@@ -293,7 +303,9 @@ def get_staff_profile_details(session: requests.Session, staff_name: str, staff_
         logger.info(f"Step 1: Making GET request to direct profile URL: {profile_url}")
 
         # Step 3: Make a GET request to the profile page
-        profile_response = session.get(profile_url, timeout=15)
+        profile_response = session.get(
+            profile_url, timeout=15, verify=config.VERIFY_SSL
+        )
         logger.info(f"Direct profile GET request completed with status: {profile_response.status_code}")
         profile_response.raise_for_status()
 

@@ -1,6 +1,7 @@
 # scraping/core.py
 from bs4 import BeautifulSoup
 import requests
+import ssl
 import logging
 import time
 from requests.adapters import HTTPAdapter
@@ -52,9 +53,14 @@ def create_session(
     )
 
     # Mount HTTPAdapter with retry strategy to session
-    adapter = HTTPAdapter(
-        max_retries=retry_strategy, pool_connections=10, pool_maxsize=20
-    )
+    if config.VERIFY_SSL is False:
+        adapter = UnsafeTLSAdapter(
+            max_retries=retry_strategy, pool_connections=10, pool_maxsize=20
+        )
+    else:
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy, pool_connections=10, pool_maxsize=20
+        )
     session.mount("https://", adapter)
     session.mount("http://", adapter)
 
@@ -110,6 +116,8 @@ def make_request(
     req_timeout = kwargs.pop("timeout", session.timeout)
 
     try:
+        if "verify" not in kwargs:
+            kwargs["verify"] = config.VERIFY_SSL
         response = session.request(method, url, timeout=req_timeout, **kwargs)
 
         # Check for specific auth failure status codes
@@ -174,3 +182,21 @@ def make_request(
             f"Unexpected error during request for {method} {url}: {e}", exc_info=True
         )
         return None
+# Force-disable TLS verification at the urllib3 layer when VERIFY_SSL is False.
+# This is more robust than relying only on session.verify in some environments.
+class UnsafeTLSAdapter(HTTPAdapter):
+    def __init__(self, *args, **kwargs):
+        self._ssl_context = ssl.create_default_context()
+        self._ssl_context.check_hostname = False
+        self._ssl_context.verify_mode = ssl.CERT_NONE
+        super().__init__(*args, **kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        pool_kwargs["ssl_context"] = self._ssl_context
+        pool_kwargs["assert_hostname"] = False
+        return super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        proxy_kwargs["ssl_context"] = self._ssl_context
+        proxy_kwargs["assert_hostname"] = False
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
