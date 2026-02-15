@@ -126,7 +126,9 @@ def get_country_from_ip(ip_address: str) -> str:
     headers = {"User-Agent": "UnisightBackend/1.0"}
 
     try:
-        response = requests.get(api_url, timeout=5, headers=headers)
+        response = requests.get(
+            api_url, timeout=5, headers=headers, verify=config.VERIFY_SSL
+        )
         response.raise_for_status()
         data = response.json()
 
