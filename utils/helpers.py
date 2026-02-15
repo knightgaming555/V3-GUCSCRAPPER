@@ -224,6 +224,7 @@ def set_in_memory_cache(key: str, value, ttl: int = MEMORY_CACHE_SHORT_TTL):
 # --- Cached Getters for Version and Dev Announcement ---
 _VERSION_CACHE_KEY = "memory:version_number"
 _DEV_ANNOUNCE_CACHE_KEY = "memory:dev_announcement"
+_DEV_ANNOUNCE_ENABLED_CACHE_KEY = "memory:dev_announcement_enabled"
 
 
 def get_version_number_cached() -> str:
@@ -291,6 +292,48 @@ def get_dev_announcement_cached() -> dict:
         logger.error(f"Error getting dev announcement from Redis: {e}", exc_info=True)
 
     return announcement
+
+
+def _coerce_bool(value, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8", errors="ignore")
+        except Exception:
+            return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes", "y", "on"):
+            return True
+        if normalized in ("false", "0", "no", "n", "off"):
+            return False
+    return default
+
+
+def get_dev_announcement_enabled_cached() -> bool:
+    """Gets dev announcement enabled flag, using memory cache first, then Redis."""
+    cached_enabled = get_from_memory_cache(_DEV_ANNOUNCE_ENABLED_CACHE_KEY)
+    if cached_enabled is not None:
+        return bool(cached_enabled)
+
+    logger.debug("Fetching dev announcement enabled flag from Redis (memory cache miss).")
+    enabled = True  # Default to enabled if not set
+    try:
+        if redis_client:
+            enabled_key_bytes = config.REDIS_DEV_ANNOUNCEMENT_ENABLED_KEY.encode("utf-8")
+            enabled_raw = redis_client.get(enabled_key_bytes)
+            enabled = _coerce_bool(enabled_raw, default=True)
+            set_in_memory_cache(_DEV_ANNOUNCE_ENABLED_CACHE_KEY, enabled)
+        else:
+            logger.warning("Redis client unavailable for dev announcement enabled check.")
+    except Exception as e:
+        logger.error(f"Error getting dev announcement enabled flag from Redis: {e}", exc_info=True)
+    return enabled
 
 
 # This function might need to be defined here if api/guc cannot be imported easily
