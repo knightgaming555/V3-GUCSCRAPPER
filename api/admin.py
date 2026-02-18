@@ -608,12 +608,19 @@ async def _run_refresh_task(username, password, section):
             # Handle specific structuring/timeouts for certain types
             if data_type == "schedule":
                 filtered = filter_schedule_details(result_or_exc)
-                timings = {  # Get timings from config or define here
-                    "0": "8:15AM-9:45AM",
-                    "1": "10:00AM-11:30AM",
-                    "2": "11:45AM-1:15PM",
-                    "3": "1:45PM-3:15PM",
-                    "4": "3:45PM-5:15PM",
+                #Normal Timings timings = {  # Get timings from config or define here
+                #    "0": "8:15AM-9:45AM",
+                #    "1": "10:00AM-11:30AM",
+                #    "2": "11:45AM-1:15PM",
+                #    "3": "1:45PM-3:15PM",
+                #    "4": "3:45PM-5:15PM",
+                #}
+                timings = {  # Ramadan Timings (example, adjust as needed)
+                    "0": "8:30AM-9:40AM",
+                    "1": "9:45AM-10:55AM",
+                    "2": "11:00AM-12:10PM",
+                    "3": "12:20PM-1:30PM",
+                    "4": "1:35PM-2:45PM",
                 }
                 data_to_cache = (filtered, timings)
                 timeout = config.CACHE_LONG_TIMEOUT
