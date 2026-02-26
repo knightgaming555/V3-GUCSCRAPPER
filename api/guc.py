@@ -47,7 +47,8 @@ except ImportError:
 
 
 CACHE_PREFIX = "guc_data"  # Use consistent prefix
-TARGET_NOTIFICATION_USERS = ["mohamed.elsaadi", "seif.elkady"]  # For user-specific notifications
+TARGET_NOTIFICATION_USERS = {"mohamed.elsaadi", "seif.elkady"}  # Strict allowlist
+AI_DEADLINES_CACHE_PREFIX = "ai_upcoming_deadlines"
 
 
 def _beautify_grade_updates_body(messages_list: list[str]) -> str:
@@ -73,6 +74,69 @@ def _beautify_grade_updates_body(messages_list: list[str]) -> str:
         output_lines.append("")
 
     return "\n".join(output_lines).strip()
+
+
+def _build_ai_deadlines_notification(username: str):
+    if username not in TARGET_NOTIFICATION_USERS:
+        return None
+
+    ai_cache_key = generate_cache_key(AI_DEADLINES_CACHE_PREFIX, username)
+    ai_payload = get_from_cache(ai_cache_key)
+    if not isinstance(ai_payload, dict):
+        return None
+
+    ai_result = ai_payload.get("result", ai_payload)
+    if not isinstance(ai_result, dict):
+        return None
+
+    generated_at = ai_payload.get("generated_at") or datetime.utcnow().isoformat()
+    try:
+        date_value = datetime.fromisoformat(str(generated_at).replace("Z", "+00:00")).strftime("%m/%d/%Y")
+    except Exception:
+        date_value = datetime.now().strftime("%m/%d/%Y")
+
+    try:
+        body_text = orjson.dumps(ai_result, option=orjson.OPT_INDENT_2).decode("utf-8")
+    except Exception:
+        body_text = str(ai_result)
+
+    return {
+        "id": f"ai_upcoming_deadlines:{username}",
+        "title": "AI Upcoming Deadlines",
+        "subject": "AI Upcoming Deadlines",
+        "date": date_value,
+        "staff": "UniSight AI",
+        "importance": "High",
+        "email_time": generated_at,
+        "body": body_text,
+    }
+
+
+def _compose_notifications_for_response(username: str, existing_notifications):
+    original_notifications = existing_notifications if isinstance(existing_notifications, list) else []
+    final_notifications = []
+
+    if get_dev_announcement_enabled_cached():
+        dev_announcement = get_dev_announcement_cached()
+        if dev_announcement:
+            has_dev = any(
+                isinstance(n, dict) and n.get("id") == dev_announcement.get("id")
+                for n in original_notifications
+            )
+            if not has_dev:
+                final_notifications.append(dev_announcement)
+
+    ai_notification = _build_ai_deadlines_notification(username)
+    if ai_notification:
+        has_ai = any(
+            isinstance(n, dict) and n.get("id") == ai_notification.get("id")
+            for n in original_notifications
+        )
+        if not has_ai:
+            final_notifications.append(ai_notification)
+
+    final_notifications.extend(original_notifications)
+    return final_notifications
 
 
 @guc_bp.route("/guc_data", methods=["GET"])
@@ -172,21 +236,12 @@ def api_guc_data():
             g.log_outcome = "memory_cache_hit"
             # Use a shallow copy so we don't mutate the cached object
             resp = dict(cached_data) if isinstance(cached_data, dict) else cached_data
-            if get_dev_announcement_enabled_cached():
-                try:
-                    dev_announcement = get_dev_announcement_cached()
-                    original_guc_notifications = resp.get("notifications", [])
-                    if not isinstance(original_guc_notifications, list):
-                        original_guc_notifications = []
-
-                    final_notifications_list = []
-                    if dev_announcement:
-                        if not any(n.get("id") == dev_announcement.get("id") for n in original_guc_notifications):
-                            final_notifications_list.append(dev_announcement)
-                    final_notifications_list.extend(original_guc_notifications)
-                    resp["notifications"] = final_notifications_list
-                except Exception as e:
-                    logger.error(f"Failed to add dev announcement or user-specific notifications to cached guc_data (in-memory): {e}")
+            try:
+                resp["notifications"] = _compose_notifications_for_response(
+                    username, resp.get("notifications", [])
+                )
+            except Exception as e:
+                logger.error(f"Failed to add dev announcement or user-specific notifications to cached guc_data (in-memory): {e}")
 
             dev_announce_duration = (time.perf_counter() - in_memory_cache_check_start_time) * 1000
             logger.info(f"TIMING: Get/Add Dev Announce (In-memory Cache Hit) took {dev_announce_duration:.2f} ms")
@@ -206,21 +261,12 @@ def api_guc_data():
             logger.info(f"Set guc_data in IN-MEMORY cache for {username}")
 
             resp = dict(cached_data) if isinstance(cached_data, dict) else cached_data
-            if get_dev_announcement_enabled_cached():
-                try:
-                    dev_announcement = get_dev_announcement_cached()
-                    original_guc_notifications = resp.get("notifications", [])
-                    if not isinstance(original_guc_notifications, list):
-                        original_guc_notifications = []
-
-                    final_notifications_list = []
-                    if dev_announcement:
-                        if not any(n.get("id") == dev_announcement.get("id") for n in original_guc_notifications):
-                            final_notifications_list.append(dev_announcement)
-                    final_notifications_list.extend(original_guc_notifications)
-                    resp["notifications"] = final_notifications_list
-                except Exception as e:
-                    logger.error(f"Failed to add dev announcement or user-specific notifications to cached guc_data: {e}")
+            try:
+                resp["notifications"] = _compose_notifications_for_response(
+                    username, resp.get("notifications", [])
+                )
+            except Exception as e:
+                logger.error(f"Failed to add dev announcement or user-specific notifications to cached guc_data: {e}")
 
             dev_announce_duration = (time.perf_counter() - redis_cache_check_start_time) * 1000
             logger.info(f"TIMING: Get/Add Dev Announce (Redis Cache Hit) took {dev_announce_duration:.2f} ms")
@@ -269,21 +315,12 @@ def api_guc_data():
 
         # Build response copy and attach dev announcement
         resp = dict(scrape_result) if isinstance(scrape_result, dict) else scrape_result
-        if get_dev_announcement_enabled_cached():
-            try:
-                dev_announcement = get_dev_announcement_cached()
-                original_guc_notifications = resp.get("notifications", [])
-                if not isinstance(original_guc_notifications, list):
-                    original_guc_notifications = []
-
-                final_notifications_list = []
-                if dev_announcement:
-                    if not any(n.get("id") == dev_announcement.get("id") for n in original_guc_notifications):
-                        final_notifications_list.append(dev_announcement)
-                final_notifications_list.extend(original_guc_notifications)
-                resp["notifications"] = final_notifications_list
-            except Exception as e:
-                logger.error(f"Failed to add dev announcement or user-specific notifications to scraped guc_data: {e}")
+        try:
+            resp["notifications"] = _compose_notifications_for_response(
+                username, resp.get("notifications", [])
+            )
+        except Exception as e:
+            logger.error(f"Failed to add dev announcement or user-specific notifications to scraped guc_data: {e}")
 
         dev_announce_duration = (time.perf_counter() - scrape_call_start_time) * 1000
         logger.info(f"TIMING: Get/Add Dev Announce (Scrape Success) took {dev_announce_duration:.2f} ms")
