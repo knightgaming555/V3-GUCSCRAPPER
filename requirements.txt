@@ -47,3 +47,4 @@ google-auth>=2.27.0
 protobuf>=4.25.0
 orjson
 openpyxl
+openai
