@@ -31,11 +31,23 @@ logger = logging.getLogger("refresh_ai_deadlines_cache")
 
 TARGET_USERS = ("mohamed.elsaadi", "seif.elkady")
 AI_DEADLINES_CACHE_PREFIX = "ai_upcoming_deadlines"
-API_BASE_URL = os.getenv("UNISIGHT_API_BASE_URL", "https://v3-gucscrapper.vercel.app")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 45
+DEFAULT_API_BASE_URL = "https://v3-gucscrapper.vercel.app"
+
+
+def _resolve_api_base_url() -> str:
+    raw = (os.getenv("UNISIGHT_API_BASE_URL") or "").strip()
+    if not raw:
+        return DEFAULT_API_BASE_URL
+    if not re.match(r"^https?://", raw, flags=re.IGNORECASE):
+        raw = f"https://{raw.lstrip('/')}"
+    return raw.rstrip("/")
+
+
+API_BASE_URL = _resolve_api_base_url()
 
 
 def get_season_weight(season_str):
