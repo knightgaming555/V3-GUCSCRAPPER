@@ -2,7 +2,7 @@ name: Refresh AI Deadlines Cache
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "*/ * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -36,6 +36,6 @@ jobs:
           REDIS_URL: ${{ secrets.REDIS_URL }}
           ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          UNISIGHT_API_BASE_URL: ${{ vars.UNISIGHT_API_BASE_URL }}
+          UNISIGHT_API_BASE_URL: ${{ vars.UNISIGHT_API_BASE_URL || 'https://v3-gucscrapper.vercel.app' }}
         run: |
           python scripts/refresh_ai_deadlines_cache.py
