@@ -1,4 +1,4 @@
-name: Prewarm User Cache (Insecure Password Input)
+name: Prewarm User Cache (Insecure Password Input_)
 
 on:
   workflow_dispatch:
