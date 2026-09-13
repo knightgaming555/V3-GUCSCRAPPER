@@ -27,6 +27,41 @@ class Config:
     CACHE_LONG_CMS_CONTENT_TIMEOUT = 18000  # CMS content cache timeout (1 hour)
     CACHE_STAFF_SCHEDULE_TIMEOUT = 18000
 
+    # Authentication
+    _AUTH_REVALIDATE_INTERVAL_RAW = os.environ.get(
+        "AUTH_REVALIDATE_INTERVAL_SECONDS", "900"
+    )
+    try:
+        AUTH_REVALIDATE_INTERVAL_SECONDS = max(
+            0, int(_AUTH_REVALIDATE_INTERVAL_RAW)
+        )
+    except ValueError:
+        AUTH_REVALIDATE_INTERVAL_SECONDS = 900
+
+    _AUTH_LOCAL_CACHE_TTL_RAW = os.environ.get(
+        "AUTH_LOCAL_CACHE_TTL_SECONDS", "120"
+    )
+    try:
+        AUTH_LOCAL_CACHE_TTL_SECONDS = max(0, int(_AUTH_LOCAL_CACHE_TTL_RAW))
+    except ValueError:
+        AUTH_LOCAL_CACHE_TTL_SECONDS = 120
+
+    _LOCAL_REDIS_CACHE_TTL_RAW = os.environ.get(
+        "LOCAL_REDIS_CACHE_TTL_SECONDS", "60"
+    )
+    try:
+        LOCAL_REDIS_CACHE_TTL_SECONDS = max(0, int(_LOCAL_REDIS_CACHE_TTL_RAW))
+    except ValueError:
+        LOCAL_REDIS_CACHE_TTL_SECONDS = 60
+
+    TIMINGS = {
+         "0": "8:15AM-9:45AM",
+                    "1": "10:00AM-11:30AM",
+                    "2": "11:45AM-1:15PM",
+                    "3": "1:45PM-3:15PM",
+                    "4": "3:45PM-5:15PM",
+    }
+
     # Admin / Secrets
     CACHE_REFRESH_SECRET = os.environ.get(
         "CACHE_REFRESH_SECRET", "default_refresh_secret"
@@ -71,7 +106,7 @@ class Config:
     # - "false" to disable SSL verification (current default)
     # - "true" to use system CAs
     # - a file path to a custom CA bundle (recommended if available)
-    _VERIFY_SSL_RAW = os.environ.get("VERIFY_SSL", "False")
+    _VERIFY_SSL_RAW = os.environ.get("VERIFY_SSL", "False").strip()
     if _VERIFY_SSL_RAW.lower() in ("true", "1", "t", "yes", "y"):
         VERIFY_SSL = True
     elif _VERIFY_SSL_RAW.lower() in ("false", "0", "f", "no", "n"):
