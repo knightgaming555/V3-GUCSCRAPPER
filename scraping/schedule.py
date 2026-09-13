@@ -15,6 +15,19 @@ logger = logging.getLogger(__name__)
 
 # --- Schedule Parsing Helpers ---
 
+# Matches GUC room codes like H9, H16, D4.205, D4.208, C7.101, C7.203, etc.
+# Used with re.search so extra text in the same cell (e.g. "C7.101 CAD Lab")
+# still yields the room code instead of "Unknown".
+LOCATION_RE = re.compile(r"([A-Z]\d+(?:\.\d+)?)")
+
+
+def _extract_location_code(text: str | None) -> str:
+    """Return the first room code found in text, else 'Unknown'."""
+    if not text:
+        return "Unknown"
+    m = LOCATION_RE.search(text)
+    return m.group(1) if m else "Unknown"
+
 
 def extract_schedule_details_from_cell(cell_html: str) -> dict:
     """
@@ -39,11 +52,10 @@ def extract_schedule_details_from_cell(cell_html: str) -> dict:
         )
         if lecture_span:
             span_text = lecture_span.get_text(separator=" ", strip=True)
-            # Extract location (e.g., H1, D5.01, C7.203) - more flexible regex
-            location_match = re.search(
-                r"([A-Z]\d+(\.\d+)?\b)$", span_text
-            )  # Matches at the end of the string
-            location = location_match.group(1) if location_match else "Unknown"
+            # Extract location (e.g., H1, D5.01, C7.203, C7.101).
+            # Use search (not end-anchored/fullmatch) so trailing lab names like
+            # "C7.101 CAD Lab" still resolve to "C7.101".
+            location = _extract_location_code(span_text)
             details["Location"] = location
 
             # Extract course name (remove "Lecture" and location)
@@ -74,20 +86,15 @@ def extract_schedule_details_from_cell(cell_html: str) -> dict:
                 details["Type"] = small_tag.get_text(strip=True)
 
                 # Location hunting: Check subsequent text nodes
-                # Look for common location patterns (H1, D5.01, etc.)
+                # Look for common location patterns (H1, D5.01, C7.101, etc.)
+                # Use search so "C7.101 CAD Lab" still yields "C7.101".
                 location = "Unknown"
                 for i in range(1, len(text_nodes)):
                     node = text_nodes[i]
-                    # Flexible regex for locations
-                    if re.fullmatch(r"[A-Z]\d+(\.\d+)?", node):
-                        location = node
+                    candidate = _extract_location_code(node)
+                    if candidate != "Unknown":
+                        location = candidate
                         break
-                    # Sometimes location might be combined like "Tut C1.04"
-                    elif details["Type"] in node:
-                        potential_loc = node.replace(details["Type"], "").strip()
-                        if re.fullmatch(r"[A-Z]\d+(\.\d+)?", potential_loc):
-                            location = potential_loc
-                            break
                 details["Location"] = location
             return details  # Found Tut/Lab with <small>, assume primary content
 
@@ -98,11 +105,15 @@ def extract_schedule_details_from_cell(cell_html: str) -> dict:
             if len(tds) >= 3:
                 # --- EDITED SECTION: START ---
                 # Check for the new Lecture format first, identified by "Lecture" in the 3rd cell.
-                third_td_text = tds[2].get_text(strip=True)
+                third_td_text = tds[2].get_text(separator=" ", strip=True)
                 if "Lecture" in third_td_text:
                     details["Type"] = "Lecture"
-                    # In the new format, Location is in the 2nd cell
-                    details["Location"] = tds[1].get_text(strip=True)
+                    # In the new format, Location is in the 2nd cell.
+                    # Extract the room code so extra text (e.g. lab names)
+                    # does not leak into Location.
+                    details["Location"] = _extract_location_code(
+                        tds[1].get_text(separator=" ", strip=True)
+                    )
                     # Course Name is in the 3rd cell (with "Lecture" removed)
                     details["Course_Name"] = third_td_text.replace("Lecture", "").strip()
                     return details # Found new lecture format, return.
@@ -114,15 +125,17 @@ def extract_schedule_details_from_cell(cell_html: str) -> dict:
                 type_str = "Unknown"
 
                 # Course Name usually in first TD
-                course_name_parts.append(tds[0].get_text(strip=True))
+                # Use separator=" " so <br>-separated values don't concatenate
+                # (e.g. "5MCTR<br>P034" -> "5MCTR P034", not "5MCTRP034").
+                course_name_parts.append(tds[0].get_text(separator=" ", strip=True))
 
-                # Location often in second TD
-                loc_text = tds[1].get_text(strip=True)
-                if re.fullmatch(r"[A-Z]\d+(\.\d+)?", loc_text):
-                    location = loc_text
+                # Location often in second TD, but it can contain extra text
+                # like "C7.101 CAD Lab" -> extract "C7.101".
+                loc_text = tds[1].get_text(separator=" ", strip=True)
+                location = _extract_location_code(loc_text)
 
                 # Type often in third TD, sometimes combined with group#
-                type_text = tds[2].get_text(strip=True)
+                type_text = tds[2].get_text(separator=" ", strip=True)
                 type_match = re.search(r"(Tut|Lab)", type_text, re.IGNORECASE)
                 if type_match:
                     type_str = type_match.group(0).capitalize()
