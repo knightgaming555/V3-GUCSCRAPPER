@@ -23,20 +23,14 @@ logger = logging.getLogger(__name__)
 schedule_bp = Blueprint("schedule_bp", __name__)
 
 SCHEDULE_MEMORY_CACHE_TTL = 1800  # 30 Minutes
-TIMINGS = {
-    "0": "8:30AM-9:40AM",
-    "1": "9:45AM-10:55AM",
-    "2": "11:00AM-12:10PM",
-    "3": "12:20PM-1:30PM",
-    "4": "1:35PM-2:45PM",
-}
+TIMINGS = config.TIMINGS
 
 SCHEDULE_SLOT_TIMINGS = {
-    0: "8:30AM-9:40AM",
-    1: "9:45AM-10:55AM",
-    2: "11:00AM-12:10PM",
-    3: "12:20PM-1:30PM",
-    4: "1:35PM-2:45PM",
+    0: "8:15AM-9:45AM",
+    1: "10:00AM-11:30AM",
+    2: "11:45AM-1:15PM",
+    3: "1:45PM-3:15PM",
+    4: "3:45PM-5:15PM",
     5: "5:30PM-7:00PM",
     6: "7:15PM-8:45PM",
     7: "9:00PM-10:30PM",
@@ -49,6 +43,46 @@ def _parse_bool_like(value):
     if isinstance(value, str):
         return value.strip().lower() in ("true", "1", "yes", "y")
     return bool(value)
+
+
+_FREE_DAY = {
+    "First Period": {"Course_Name": "Chill", "Location": "Free", "Type": "Free"},
+    "Second Period": {"Course_Name": "Chill", "Location": "Free", "Type": "Free"},
+    "Third Period": {"Course_Name": "Chill", "Location": "Free", "Type": "Free"},
+    "Fourth Period": {"Course_Name": "Chill", "Location": "Free", "Type": "Free"},
+    "Fifth Period": {"Course_Name": "Chill", "Location": "Free", "Type": "Free"},
+}
+
+_ALL_FREE_SCHEDULE = {day: dict(_FREE_DAY) for day in ["Saturday", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday"]}
+
+
+def _replace_with_config_timings(payload):
+    if isinstance(payload, list) and payload:
+        timetable = payload[0]
+    elif isinstance(payload, dict):
+        timetable = payload
+    else:
+        timetable = {}
+    if not timetable:
+        timetable = _ALL_FREE_SCHEDULE
+    return [timetable, TIMINGS]
+
+
+def _replace_staff_schedule_timings(payload):
+    if isinstance(payload, list) and payload:
+        timetable = payload[0]
+        profile = payload[2] if len(payload) > 2 else None
+    elif isinstance(payload, dict):
+        timetable = payload
+        profile = None
+    else:
+        timetable = {}
+        profile = None
+
+    normalized = [timetable, TIMINGS]
+    if profile is not None:
+        normalized.append(profile)
+    return normalized
 
 
 def is_schedule_empty(schedule_data: dict) -> bool:
@@ -128,7 +162,7 @@ def api_schedule():
     # optional mock user
     if username == "google.user" and password == "google@3569":
         logger.info(f"Serving mock schedule data for user {username}")
-        return jsonify(schedule_mockData), 200
+        return jsonify(_replace_with_config_timings(schedule_mockData)), 200
 
     try:
         password_to_use = get_password_for_readonly_session(username, password)
@@ -143,6 +177,8 @@ def api_schedule():
         if cached_data is not None:
             logger.info(f"Serving schedule from IN-MEMORY cache for {username}")
             g.log_outcome = "memory_cache_hit"
+            cached_data = _replace_with_config_timings(cached_data)
+            set_in_memory_cache(cache_key, cached_data, ttl=SCHEDULE_MEMORY_CACHE_TTL)
             return jsonify(cached_data), 200
 
         # 2) redis cache
@@ -154,6 +190,8 @@ def api_schedule():
         if cached_data is not None and not force_refresh:
             logger.info(f"Serving schedule from REDIS cache for {username}")
             g.log_outcome = "redis_cache_hit"
+            cached_data = _replace_with_config_timings(cached_data)
+            set_in_cache(cache_key, cached_data, timeout=config.CACHE_LONG_TIMEOUT)
             # populate in-memory cache for faster subsequent hits
             set_in_memory_cache(cache_key, cached_data, ttl=SCHEDULE_MEMORY_CACHE_TTL)
             return jsonify(cached_data), 200
@@ -173,7 +211,9 @@ def api_schedule():
             return jsonify({"status": "error", "message": error_msg}), 502
 
         filtered_data = filter_schedule_details(raw_schedule)
-        response_data = [filtered_data, TIMINGS]
+        if not filtered_data:
+            filtered_data = _ALL_FREE_SCHEDULE
+        response_data = _replace_with_config_timings([filtered_data, TIMINGS])
 
         # cache result (redis + in-memory)
         set_in_cache(cache_key, response_data, timeout=config.CACHE_LONG_TIMEOUT)
@@ -249,6 +289,8 @@ def api_staff_schedule():
 
         if cached_data is not None:
             logger.info(f"Serving staff schedule from IN-MEMORY cache for {username}")
+            cached_data = _replace_staff_schedule_timings(cached_data)
+            set_in_memory_cache(user_cache_key, cached_data, ttl=SCHEDULE_MEMORY_CACHE_TTL)
             return jsonify(cached_data), 200
 
     # 2) check redis cache
@@ -260,6 +302,8 @@ def api_staff_schedule():
 
         if cached_data is not None:
             logger.info(f"Serving staff schedule from REDIS cache for {username}")
+            cached_data = _replace_staff_schedule_timings(cached_data)
+            set_in_cache(user_cache_key, cached_data, timeout=config.CACHE_STAFF_SCHEDULE_TIMEOUT)
             set_in_memory_cache(user_cache_key, cached_data, ttl=SCHEDULE_MEMORY_CACHE_TTL)
             return jsonify(cached_data), 200
 
@@ -329,7 +373,7 @@ def api_staff_schedule():
             return jsonify({"status": "error", "message": msg}), 502
 
         formatted_schedule = _format_staff_schedule_for_client(schedule_part, SCHEDULE_SLOT_TIMINGS)
-        response_payload = [formatted_schedule, SCHEDULE_SLOT_TIMINGS, profile_part]
+        response_payload = _replace_staff_schedule_timings([formatted_schedule, SCHEDULE_SLOT_TIMINGS, profile_part])
 
         # cache the response for this user+staff
         set_in_cache(user_cache_key, response_payload, timeout=config.CACHE_STAFF_SCHEDULE_TIMEOUT)
