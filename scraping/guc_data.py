@@ -5,8 +5,6 @@ from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 import time  # For perf_counter
 from time import perf_counter  # Explicit import
-import pycurl  # Use pycurl
-from io import BytesIO
 import json  # For error dicts
 
 from config import config  # Import the singleton instance
@@ -14,141 +12,108 @@ from config import config  # Import the singleton instance
 logger = logging.getLogger(__name__)
 
 
-# --- PycURL Fetching ---
-def multi_fetch(urls: list[str], userpwd: str) -> tuple[dict, dict]:
-    """Fetches multiple URLs concurrently using pycurl.CurlMulti."""
-    multi = pycurl.CurlMulti()
-    handles = []
-    buffers = {}
-    results = {}
-    errors = {}
-    start_time = perf_counter()
+# --- Concurrent fetching via requests (replaces pycurl) ---
+# NOTE: pycurl was removed here because its libcurl build is fragile on
+# Windows/Vercel (CURLE_NOT_BUILT_IN / error 4 on setopt, e.g. missing NTLM
+# or SSL backend mismatch). Every other scraper already uses
+# scraping.core.create_session/make_request (requests + NTLM), and auth via
+# that path succeeds, so guc_data now uses the same path.
+import concurrent.futures
 
-    # Prepare handles
-    for url in urls:
-        buffer = BytesIO()
-        try:
-            c = pycurl.Curl()
-            c.setopt(c.URL, url)
-            c.setopt(c.HTTPAUTH, pycurl.HTTPAUTH_NTLM)
-            c.setopt(c.USERPWD, userpwd)
-            c.setopt(c.WRITEDATA, buffer)
-            c.setopt(c.FOLLOWLOCATION, True)
-            c.setopt(c.TIMEOUT, config.DEFAULT_REQUEST_TIMEOUT)  # Use config timeout
-            # Disable SSL verification if configured
-            c.setopt(c.SSL_VERIFYPEER, 1 if config.VERIFY_SSL else 0)
-            c.setopt(c.SSL_VERIFYHOST, 2 if config.VERIFY_SSL else 0)
-            c.setopt(
-                c.USERAGENT, "UnisightApp/Client (Python-PycURL/Sync)"
-            )  # Identify client
-            multi.add_handle(c)
-            handles.append(c)
-            buffers[c] = buffer  # Use handle as key for easy lookup later
-        except pycurl.error as e:
-            logger.error(f"Error setting up pycurl handle for {url}: {e}")
-            errors[url] = f"pycurl setup error: {e}"
-            results[url] = ""  # Ensure result entry exists even on setup failure
+try:
+    from .core import create_session, make_request
+except ImportError:  # pragma: no cover - fallback for odd import contexts
+    from scraping.core import create_session, make_request
 
-    # Perform requests
-    num_handles = len(handles)
-    while num_handles:
-        try:
-            ret, num_handles_active = multi.perform()
-            # Check for errors during perform
-            # ret might be pycurl.E_OK even if some transfers failed, need checkinfo later
-            if ret != pycurl.E_OK and ret != pycurl.E_CALL_MULTI_PERFORM:
-                logger.warning(f"multi.perform() returned error code: {ret}")
 
-            num_handles = num_handles_active
-            if num_handles_active:
-                # Wait for activity or timeout
-                multi.select(1.0)  # Wait up to 1 second
-        except Exception as e_perform:
-            logger.error(
-                f"Exception during multi.perform/select: {e_perform}", exc_info=True
-            )
-            # Mark remaining handles as error? Difficult to know which one caused it.
-            # Best effort: try checkinfo below.
-            break  # Exit loop on perform error
-
-    duration = perf_counter() - start_time
-    logger.debug(f"pycurl multi_fetch completed in {duration:.3f}s")
-
-    # Process results
-    while True:
-        try:
-            num_q, ok_list, err_list = multi.info_read()
-            for handle in ok_list:
-                url = handle.getinfo(
-                    pycurl.EFFECTIVE_URL
-                )  # Get URL associated with this handle
-                http_code = handle.getinfo(pycurl.HTTP_CODE)
-                buffer = buffers.get(handle)
-                if buffer:
-                    try:
-                        content = buffer.getvalue().decode("utf-8", errors="replace")
-                        results[url] = content
-                        logger.debug(f"Fetch success for {url} (Status: {http_code})")
-                        # Check for GUC application errors even if status is 200
-                        if "Login Failed!" in content or "Object moved" in content:
-                            logger.warning(
-                                f"Auth failure detected in content for {url}"
-                            )
-                            errors[url] = "Authentication failed (content check)"
-                    except Exception as decode_err:
-                        logger.error(f"Error decoding response for {url}: {decode_err}")
-                        errors[url] = f"Decode error: {decode_err}"
-                        results[url] = ""  # Store empty on decode error
-                else:
-                    logger.error(f"Buffer not found for successful handle: {url}")
-                    errors[url] = "Internal buffer error"
-                    results[url] = ""
-
-                multi.remove_handle(handle)
-                handle.close()
-
-            for handle, err_no, err_msg in err_list:
-                url = handle.getinfo(pycurl.EFFECTIVE_URL)
-                http_code = handle.getinfo(
-                    pycurl.HTTP_CODE
-                )  # Get code even on error if possible
-                logger.error(
-                    f"Fetch error for {url} (Status: {http_code}): {err_no} - {err_msg}"
-                )
-                errors[url] = f"pycurl error {err_no}: {err_msg}"
-                results[url] = ""  # Store empty on error
-                multi.remove_handle(handle)
-                handle.close()
-
-            if num_q == 0:
-                break
-        except Exception as e_info:
-            logger.error(f"Exception during multi.info_read: {e_info}", exc_info=True)
-            break  # Exit loop on info_read error
-
-    # Cleanup remaining handles (shouldn't be needed if info_read worked)
-    for handle in handles:
-        try:
-            multi.remove_handle(handle)
-        except:
-            pass
-        try:
-            handle.close()
-        except:
-            pass
+def _parse_userpwd(userpwd: str) -> tuple[str, str, str]:
+    """Parses 'DOMAIN\\username:password' into (domain, username, password)."""
+    domain, username, password = "GUC", "", ""
     try:
-        multi.close()
-    except:
+        creds, _, password = (userpwd or "").partition(":")
+        # password itself may contain ':'; partition above only splits on the
+        # first one, but that breaks if... actually user part never contains
+        # ':' so first ':' is the separator. Rejoin the rest correctly:
+        # partition already keeps the remainder in `password`, which is right.
+        if "\\" in creds:
+            domain, _, username = creds.partition("\\")
+            username = username.lstrip("\\")
+        else:
+            username = creds
+    except Exception:
         pass
+    return domain or "GUC", username, password
+
+
+def _fetch_single(url: str, username: str, password: str, domain: str) -> tuple[str, str, str | None]:
+    """Fetches one URL with a dedicated requests session. Returns (url, text, error)."""
+    try:
+        session = create_session(username=username, password=password, domain=domain)
+        resp = make_request(
+            session,
+            url,
+            method="GET",
+            timeout=(config.DEFAULT_REQUEST_TIMEOUT, config.DEFAULT_REQUEST_TIMEOUT * 2),
+        )
+        if resp is None:
+            return url, "", "request failed after retries (see logs: 401/timeout/connection/login-redirect)"
+        try:
+            content = resp.text
+        except Exception as decode_err:
+            logger.error(f"Error decoding response for {url}: {decode_err}")
+            return url, "", f"Decode error: {decode_err}"
+        if "Login Failed!" in content or "Object moved" in content:
+            logger.warning(f"Auth failure detected in content for {url}")
+            return url, content, "Authentication failed (content check)"
+        logger.debug(f"Fetch success for {url} (Status: {resp.status_code})")
+        return url, content, None
+    except Exception as e:
+        logger.error(f"Fetch exception for {url}: {e}", exc_info=True)
+        return url, "", f"fetch exception: {e}"
+
+
+def multi_fetch(urls: list[str], userpwd: str) -> tuple[dict, dict]:
+    """Fetches multiple URLs concurrently using requests + NTLM (thread per URL).
+
+    Keeps the original (results, errors) return shape so callers are unchanged.
+    """
+    start_time = perf_counter()
+    results: dict = {}
+    errors: dict = {}
+    domain, username, password = _parse_userpwd(userpwd)
+
+    if not urls:
+        return results, errors
+
+    max_workers = max(1, min(len(urls), 4))
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max_workers, thread_name_prefix="GucDataFetch"
+    ) as executor:
+        future_to_url = {
+            executor.submit(_fetch_single, url, username, password, domain): url
+            for url in urls
+        }
+        for future in concurrent.futures.as_completed(future_to_url):
+            url = future_to_url[future]
+            try:
+                f_url, content, err = future.result()
+                results[f_url] = content
+                if err:
+                    errors[f_url] = err
+            except Exception as e:
+                logger.error(f"Exception fetching {url}: {e}", exc_info=True)
+                results[url] = ""
+                errors[url] = f"fetch exception: {e}"
 
     # Ensure results dict contains entries for all original URLs
-    original_urls_set = set(urls)
-    for url in original_urls_set:
+    for url in set(urls):
         if url not in results:
-            results[url] = ""  # Ensure entry exists if fetch failed badly
+            results[url] = ""
             if url not in errors:
                 errors[url] = "Fetch failed (unknown reason)"
 
+    duration = perf_counter() - start_time
+    logger.debug(f"requests multi_fetch completed in {duration:.3f}s")
     return results, errors
 
 
@@ -266,7 +231,7 @@ def scrape_guc_data_fast(
     username: str, password: str, domain: str = "GUC"
 ) -> dict | None:
     """
-    Synchronously scrapes student info and notifications using pycurl.
+    Synchronously scrapes student info and notifications using requests + NTLM.
 
     Args:
         username (str): User's university ID.
@@ -275,7 +240,7 @@ def scrape_guc_data_fast(
 
     Returns:
         dict: A dictionary containing 'student_info' and 'notifications',
-              or dict with 'error' on failure. Returns None on critical pycurl setup issues.
+              or dict with 'error' on failure. Returns None on critical setup issues.
     """
     urls = config.GUC_DATA_URLS
     if len(urls) != 2:
@@ -284,15 +249,15 @@ def scrape_guc_data_fast(
 
     index_url, notif_url = urls
     ntlm_user = f"{domain}\\{username}"
-    userpwd = f"{ntlm_user}:{password}"  # Format for pycurl
+    userpwd = f"{ntlm_user}:{password}"  # Kept for multi_fetch signature compat
 
     try:
         start_scrape_time = perf_counter()
-        logger.info(f"Starting pycurl scrape for {username}")
+        logger.info(f"Starting requests scrape for {username}")
         results, errors = multi_fetch(urls, userpwd)
         duration = perf_counter() - start_scrape_time
         logger.info(
-            f"Pycurl multi_fetch part finished in {duration:.3f}s for {username}"
+            f"Requests multi_fetch part finished in {duration:.3f}s for {username}"
         )
 
         # --- Check for critical failures ---
@@ -370,14 +335,6 @@ def scrape_guc_data_fast(
         logger.info(f"Successfully scraped GUC data (sync) for {username}")
         return final_data
 
-    except pycurl.error as e:
-        # Errors during pycurl setup or critical multi.perform issues
-        error_code, error_msg = e.args
-        logger.error(
-            f"Critical PycURL error during scraping for {username}: Code {error_code} - {error_msg}",
-            exc_info=True,
-        )
-        return {"error": f"Network layer error during scraping: {error_msg}"}
     except Exception as e:
         logger.error(
             f"Unexpected error in scrape_guc_data_fast for {username}: {e}",
